@@ -7,6 +7,16 @@ import random
 # --- Rollenname, der /newvideo nutzen darf (muss EXAKT so heißen wie deine Rolle) ---
 ERLAUBTE_ROLLE = "⭐ᴄᴏɴᴛᴇɴᴛ ᴄʀᴇᴀᴛᴏʀ"
 
+# --- Self-Role Buttons: hier deine 6 Rollen eintragen (Emoji, Anzeigename, EXAKTER Rollenname auf dem Server) ---
+SELF_ROLLEN = [
+    {"emoji": "📢", "label": "Announcement", "rollenname": "Announcement"},
+    {"emoji": "🔔", "label": "Sub Announcement", "rollenname": "Sub Announcement"},
+    {"emoji": "🎉", "label": "Events", "rollenname": "Events"},
+    {"emoji": "📱", "label": "Social Media", "rollenname": "Social Media"},
+    {"emoji": "📊", "label": "Polls", "rollenname": "Polls"},
+    {"emoji": "⭐", "label": "Content Creator", "rollenname": "Content Creator"},
+]
+
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
 PREFIX = "!"  # Befehle starten z.B. mit !hallo
@@ -17,10 +27,47 @@ intents.message_content = True  # wichtig, damit der Bot Nachrichten lesen kann
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
+# --- Self-Role Button-Logik ---
+class RollenView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # timeout=None = Buttons funktionieren dauerhaft, auch nach Neustart
+        for rolle_info in SELF_ROLLEN:
+            self.add_item(RollenButton(rolle_info))
+
+class RollenButton(discord.ui.Button):
+    def __init__(self, rolle_info):
+        super().__init__(
+            label=rolle_info["label"],
+            emoji=rolle_info["emoji"],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"rolle_{rolle_info['rollenname']}"  # wichtig: muss eindeutig + dauerhaft sein
+        )
+        self.rollenname = rolle_info["rollenname"]
+
+    async def callback(self, interaction: discord.Interaction):
+        rolle = discord.utils.get(interaction.guild.roles, name=self.rollenname)
+
+        if rolle is None:
+            await interaction.response.send_message(
+                f"⚠️ Die Rolle '{self.rollenname}' wurde auf dem Server nicht gefunden.",
+                ephemeral=True
+            )
+            return
+
+        if rolle in interaction.user.roles:
+            # Hatte die Rolle schon -> entfernen
+            await interaction.user.remove_roles(rolle)
+            await interaction.response.send_message(f"❌ Rolle **{self.rollenname}** entfernt.", ephemeral=True)
+        else:
+            # Hatte die Rolle noch nicht -> hinzufügen
+            await interaction.user.add_roles(rolle)
+            await interaction.response.send_message(f"✅ Rolle **{self.rollenname}** hinzugefügt!", ephemeral=True)
+
 # --- Wird ausgeführt, wenn der Bot online geht ---
 @bot.event
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user}")
+    bot.add_view(RollenView())  # sorgt dafür, dass die Buttons auch nach Neustart klickbar bleiben
     try:
         synced = await bot.tree.sync()
         print(f"🔄 {len(synced)} Slash-Commands synchronisiert")
@@ -101,6 +148,16 @@ async def newvideo(interaction: discord.Interaction, link: str, plattform: app_c
     ping_text = ping_rolle.mention if ping_rolle else ""
 
     await interaction.response.send_message(content=ping_text, embed=embed)
+
+# --- /rollen: Postet die Nachricht mit den Self-Role Buttons ---
+@bot.tree.command(name="rollen", description="Postet die Benachrichtigungs-Rollen zum Anklicken")
+async def rollen(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎭 Benachrichtigungs-Rollen",
+        description="Wähle hier aus, bei welchen Ereignissen du gepingt werden möchtest.\nKlicke einfach auf die Buttons, um Rollen zu verwalten.",
+        color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(embed=embed, view=RollenView())
 
 # --- Bot starten ---
 bot.run(TOKEN)
