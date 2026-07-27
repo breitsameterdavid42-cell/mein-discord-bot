@@ -34,6 +34,19 @@ def voice_kategorie_speichern(kategorie_id):
     with open(VOICE_DATEI, "w") as f:
         json.dump({"kategorie_id": kategorie_id}, f)
 
+# --- Speicherort für die per /event-setup eingerichtete Config ---
+EVENT_DATEI = "event_config.json"
+
+def event_config_laden():
+    if os.path.exists(EVENT_DATEI):
+        with open(EVENT_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def event_config_speichern(link, channel_id):
+    with open(EVENT_DATEI, "w") as f:
+        json.dump({"link": link, "channel_id": channel_id}, f)
+
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
 PREFIX = "!"  # Befehle starten z.B. mit !hallo
@@ -276,6 +289,50 @@ async def voice_setup(interaction: discord.Interaction, channel: discord.TextCha
         f"✅ Eingerichtet! Der Button wurde in {channel.mention} gepostet, neue Channels landen in **{kategorie.name}**.",
         ephemeral=True
     )
+
+# --- /event-setup: Admin trägt einmalig den Roblox-Link + Ziel-Channel ein ---
+@bot.tree.command(name="event-setup", description="[Admin] Richtet den Roblox-Spiel-Link für Events ein")
+@app_commands.describe(link="Der Link zu deinem Roblox-Spiel", channel="In welchem Channel sollen Events gepostet werden?")
+@app_commands.checks.has_permissions(administrator=True)
+async def event_setup(interaction: discord.Interaction, link: str, channel: discord.TextChannel):
+    event_config_speichern(link, str(channel.id))
+    await interaction.response.send_message(
+        f"✅ Eingerichtet! Events werden ab jetzt in {channel.mention} gepostet, mit Link zu: {link}",
+        ephemeral=True
+    )
+
+# --- /event: Postet eine Event-Ankündigung (z.B. "x1 Speed") ---
+@bot.tree.command(name="event", description="Kündige ein laufendes Event an (z.B. x1 Speed)")
+@app_commands.describe(text="Was ist das Event? (z.B. 'x1 Speed')")
+async def event(interaction: discord.Interaction, text: str):
+    config = event_config_laden()
+    if config is None:
+        await interaction.response.send_message(
+            "⚠️ Es wurde noch kein Roblox-Link eingerichtet. Ein Admin muss zuerst `/event-setup` ausführen.",
+            ephemeral=True
+        )
+        return
+
+    channel = interaction.guild.get_channel(int(config["channel_id"]))
+    if channel is None:
+        await interaction.response.send_message("⚠️ Der eingerichtete Channel existiert nicht mehr.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🎮 Event läuft gerade!",
+        description=f"**{text}**",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="🔗 Spiel beitreten", value=f"[HIER KLICKEN]({config['link']})", inline=False)
+    embed.set_footer(text=f"Gestartet von {interaction.user.display_name}")
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+    # --- Falls es eine Rolle "Events" gibt, wird sie automatisch gepingt ---
+    events_rolle = discord.utils.get(interaction.guild.roles, name="Events")
+    ping_text = events_rolle.mention if events_rolle else ""
+
+    await channel.send(content=ping_text, embed=embed)
+    await interaction.response.send_message(f"✅ Event in {channel.mention} gepostet!", ephemeral=True)
 
 # --- Bot starten ---
 bot.run(TOKEN)
