@@ -3,19 +3,23 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import random
+import json
 
 # --- Rollenname, der /newvideo nutzen darf (muss EXAKT so heißen wie deine Rolle) ---
 ERLAUBTE_ROLLE = "⭐ᴄᴏɴᴛᴇɴᴛ ᴄʀᴇᴀᴛᴏʀ"
 
-# --- Self-Role Buttons: hier deine 6 Rollen eintragen (Emoji, Anzeigename, EXAKTER Rollenname auf dem Server) ---
-SELF_ROLLEN = [
-    {"emoji": "📢", "label": "Announcement", "rollenname": "Announcement"},
-    {"emoji": "🔔", "label": "Sub Announcement", "rollenname": "Sub Announcement"},
-    {"emoji": "🎉", "label": "Events", "rollenname": "Events"},
-    {"emoji": "📱", "label": "Social Media", "rollenname": "Social Media"},
-    {"emoji": "📊", "label": "Polls", "rollenname": "Polls"},
-    {"emoji": "⭐", "label": "Content Creator", "rollenname": "Content Creator"},
-]
+# --- Speicherort für die per /rollen-setup ausgewählten Rollen ---
+ROLLEN_DATEI = "rollen_config.json"
+
+def rollen_laden():
+    if os.path.exists(ROLLEN_DATEI):
+        with open(ROLLEN_DATEI, "r") as f:
+            return json.load(f)
+    return []  # noch keine Rollen konfiguriert
+
+def rollen_speichern(rollen_liste):
+    with open(ROLLEN_DATEI, "w") as f:
+        json.dump(rollen_liste, f)
 
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
@@ -31,37 +35,56 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 class RollenView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # timeout=None = Buttons funktionieren dauerhaft, auch nach Neustart
-        for rolle_info in SELF_ROLLEN:
+        for rolle_info in rollen_laden():
             self.add_item(RollenButton(rolle_info))
 
 class RollenButton(discord.ui.Button):
     def __init__(self, rolle_info):
         super().__init__(
-            label=rolle_info["label"],
-            emoji=rolle_info["emoji"],
+            label=rolle_info["name"],
+            emoji=rolle_info.get("emoji") or None,
             style=discord.ButtonStyle.secondary,
-            custom_id=f"rolle_{rolle_info['rollenname']}"  # wichtig: muss eindeutig + dauerhaft sein
+            custom_id=f"rolle_{rolle_info['id']}"  # wichtig: muss eindeutig + dauerhaft sein
         )
-        self.rollenname = rolle_info["rollenname"]
+        self.rollen_id = int(rolle_info["id"])
 
     async def callback(self, interaction: discord.Interaction):
-        rolle = discord.utils.get(interaction.guild.roles, name=self.rollenname)
+        rolle = interaction.guild.get_role(self.rollen_id)
 
         if rolle is None:
             await interaction.response.send_message(
-                f"⚠️ Die Rolle '{self.rollenname}' wurde auf dem Server nicht gefunden.",
+                "⚠️ Diese Rolle existiert nicht mehr auf dem Server.",
                 ephemeral=True
             )
             return
 
         if rolle in interaction.user.roles:
-            # Hatte die Rolle schon -> entfernen
             await interaction.user.remove_roles(rolle)
-            await interaction.response.send_message(f"❌ Rolle **{self.rollenname}** entfernt.", ephemeral=True)
+            await interaction.response.send_message(f"❌ Rolle **{rolle.name}** entfernt.", ephemeral=True)
         else:
-            # Hatte die Rolle noch nicht -> hinzufügen
             await interaction.user.add_roles(rolle)
-            await interaction.response.send_message(f"✅ Rolle **{self.rollenname}** hinzugefügt!", ephemeral=True)
+            await interaction.response.send_message(f"✅ Rolle **{rolle.name}** hinzugefügt!", ephemeral=True)
+
+# --- Auswahlmenü für /rollen-setup ---
+class RollenSetupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="Wähle bis zu 6 Rollen aus",
+        min_values=1,
+        max_values=6
+    )
+    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        rollen_liste = [{"id": str(r.id), "name": r.name, "emoji": None} for r in select.values]
+        rollen_speichern(rollen_liste)
+        namen = ", ".join(r.name for r in select.values)
+        await interaction.response.send_message(
+            f"✅ Gespeichert! Diese Rollen werden jetzt bei `/rollen` angezeigt: **{namen}**\n"
+            f"Nutze jetzt `/rollen`, um die Buttons zu posten.",
+            ephemeral=True
+        )
 
 # --- Wird ausgeführt, wenn der Bot online geht ---
 @bot.event
@@ -149,9 +172,27 @@ async def newvideo(interaction: discord.Interaction, link: str, plattform: app_c
 
     await interaction.response.send_message(content=ping_text, embed=embed)
 
+# --- /rollen-setup: Admin wählt hier die 6 Rollen per Menü aus ---
+@bot.tree.command(name="rollen-setup", description="[Admin] Wähle die Rollen für das Self-Role Menü aus")
+@app_commands.checks.has_permissions(administrator=True)
+async def rollen_setup(interaction: discord.Interaction):
+    view = RollenSetupView()
+    await interaction.response.send_message(
+        "Wähle unten bis zu 6 Rollen aus, die im `/rollen`-Menü erscheinen sollen:",
+        view=view,
+        ephemeral=True
+    )
+
 # --- /rollen: Postet die Nachricht mit den Self-Role Buttons ---
 @bot.tree.command(name="rollen", description="Postet die Benachrichtigungs-Rollen zum Anklicken")
 async def rollen(interaction: discord.Interaction):
+    if not rollen_laden():
+        await interaction.response.send_message(
+            "⚠️ Es sind noch keine Rollen eingerichtet. Ein Admin muss zuerst `/rollen-setup` ausführen.",
+            ephemeral=True
+        )
+        return
+
     embed = discord.Embed(
         title="🎭 Benachrichtigungs-Rollen",
         description="Wähle hier aus, bei welchen Ereignissen du gepingt werden möchtest.\nKlicke einfach auf die Buttons, um Rollen zu verwalten.",
