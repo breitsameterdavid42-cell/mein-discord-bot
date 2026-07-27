@@ -21,6 +21,19 @@ def rollen_speichern(rollen_liste):
     with open(ROLLEN_DATEI, "w") as f:
         json.dump(rollen_liste, f)
 
+# --- Speicherort für die per /voice-setup ausgewählte Kategorie ---
+VOICE_DATEI = "voice_config.json"
+
+def voice_kategorie_laden():
+    if os.path.exists(VOICE_DATEI):
+        with open(VOICE_DATEI, "r") as f:
+            return json.load(f).get("kategorie_id")
+    return None
+
+def voice_kategorie_speichern(kategorie_id):
+    with open(VOICE_DATEI, "w") as f:
+        json.dump({"kategorie_id": kategorie_id}, f)
+
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
 PREFIX = "!"  # Befehle starten z.B. mit !hallo
@@ -28,6 +41,8 @@ PREFIX = "!"  # Befehle starten z.B. mit !hallo
 # --- Bot erstellen ---
 intents = discord.Intents.default()
 intents.message_content = True  # wichtig, damit der Bot Nachrichten lesen kann
+intents.voice_states = True  # wichtig, damit der Bot Nutzer in Voice-Channels verschieben kann
+intents.members = True  # wichtig für Rollen-Verwaltung
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
@@ -86,11 +101,54 @@ class RollenSetupView(discord.ui.View):
             ephemeral=True
         )
 
+# --- "Create a Voice" Button-Logik ---
+class VoiceCreatorView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # timeout=None = Button funktioniert dauerhaft, auch nach Neustart
+
+    @discord.ui.button(label="Create", style=discord.ButtonStyle.primary, emoji="🎙️", custom_id="create_voice_channel")
+    async def create_voice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        kategorie_id = voice_kategorie_laden()
+        if kategorie_id is None:
+            await interaction.response.send_message(
+                "⚠️ Es wurde noch keine Kategorie eingerichtet. Ein Admin muss zuerst `/voice-setup` ausführen.",
+                ephemeral=True
+            )
+            return
+
+        kategorie = interaction.guild.get_channel(int(kategorie_id))
+        if kategorie is None:
+            await interaction.response.send_message(
+                "⚠️ Die eingerichtete Kategorie existiert nicht mehr.",
+                ephemeral=True
+            )
+            return
+
+        # --- Neuen Voice-Channel erstellen, benannt nach dem User ---
+        neuer_channel = await interaction.guild.create_voice_channel(
+            name=f"{interaction.user.display_name}'s Channel",
+            category=kategorie
+        )
+
+        # --- Falls der User schon in einem Voice-Channel ist, direkt reinschieben ---
+        if interaction.user.voice:
+            await interaction.user.move_to(neuer_channel)
+            await interaction.response.send_message(
+                f"✅ Dein Voice-Channel {neuer_channel.mention} wurde erstellt, du wurdest direkt reinverschoben!",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ Dein Voice-Channel {neuer_channel.mention} wurde erstellt! Tritt ihm manuell bei.",
+                ephemeral=True
+            )
+
 # --- Wird ausgeführt, wenn der Bot online geht ---
 @bot.event
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user}")
     bot.add_view(RollenView())  # sorgt dafür, dass die Buttons auch nach Neustart klickbar bleiben
+    bot.add_view(VoiceCreatorView())
     try:
         synced = await bot.tree.sync()
         print(f"🔄 {len(synced)} Slash-Commands synchronisiert")
@@ -199,6 +257,25 @@ async def rollen(interaction: discord.Interaction):
         color=discord.Color.blurple()
     )
     await interaction.response.send_message(embed=embed, view=RollenView())
+
+# --- /voice-setup: Admin wählt Channel + Kategorie für den Voice-Creator aus ---
+@bot.tree.command(name="voice-setup", description="[Admin] Richtet den 'Create a Voice' Button ein")
+@app_commands.describe(channel="In welchem Channel soll der Button gepostet werden?", kategorie="In welcher Kategorie sollen die Voice-Channels erstellt werden?")
+@app_commands.checks.has_permissions(administrator=True)
+async def voice_setup(interaction: discord.Interaction, channel: discord.TextChannel, kategorie: discord.CategoryChannel):
+    voice_kategorie_speichern(str(kategorie.id))
+
+    embed = discord.Embed(
+        title="🎙️ Create a Voice",
+        description="Klicke auf den Button, um deinen eigenen Voice-Channel zu erstellen.",
+        color=discord.Color.blue()
+    )
+    await channel.send(embed=embed, view=VoiceCreatorView())
+
+    await interaction.response.send_message(
+        f"✅ Eingerichtet! Der Button wurde in {channel.mention} gepostet, neue Channels landen in **{kategorie.name}**.",
+        ephemeral=True
+    )
 
 # --- Bot starten ---
 bot.run(TOKEN)
