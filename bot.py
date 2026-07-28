@@ -95,6 +95,110 @@ def giveaways_speichern(giveaways):
     with open(GIVEAWAY_DATEI, "w") as f:
         json.dump(giveaways, f)
 
+# --- Speicherort für alle laufenden Timer ---
+TIMER_DATEI = "timer_config.json"
+
+def timer_laden():
+    if os.path.exists(TIMER_DATEI):
+        with open(TIMER_DATEI, "r") as f:
+            return json.load(f)
+    return {}
+
+def timer_speichern(timers):
+    with open(TIMER_DATEI, "w") as f:
+        json.dump(timers, f)
+
+def zeit_aufteilen(sekunden: int):
+    """Wandelt eine Sekundenzahl in (Tage, Stunden, Minuten, Sekunden) um."""
+    sekunden = max(int(sekunden), 0)
+    tage, rest = divmod(sekunden, 86400)
+    stunden, rest = divmod(rest, 3600)
+    minuten, sek = divmod(rest, 60)
+    return tage, stunden, minuten, sek
+
+def timer_embed_bauen(daten: dict, rest_sekunden: int, abgelaufen: bool = False) -> discord.Embed:
+    """Baut das Countdown-Embed für einen Timer."""
+    tage, stunden, minuten, sek = zeit_aufteilen(rest_sekunden)
+
+    if abgelaufen:
+        embed = discord.Embed(
+            title="⏰ Timer abgelaufen!",
+            description=f"**{daten['grund']}**",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Status", value="✅ Die Zeit ist um!", inline=False)
+    else:
+        embed = discord.Embed(
+            title="⏳ Timer läuft",
+            description=f"**{daten['grund']}**",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="📅 Tage", value=f"```{tage}```", inline=True)
+        embed.add_field(name="🕐 Stunden", value=f"```{stunden}```", inline=True)
+        embed.add_field(name="⏱️ Minuten", value=f"```{minuten}```", inline=True)
+        embed.add_field(name="⏲️ Sekunden", value=f"```{sek}```", inline=True)
+        embed.add_field(
+            name="🔔 Endet",
+            value=f"<t:{daten['ende_timestamp']}:f> (<t:{daten['ende_timestamp']}:R>)",
+            inline=False
+        )
+
+    embed.set_footer(text=f"Gestartet von {daten.get('ersteller_name', 'Unbekannt')}")
+    return embed
+
+# --- Merkt sich laufende Timer-Tasks, damit sie z.B. per /timerstop abgebrochen werden können ---
+timer_tasks: dict[str, asyncio.Task] = {}
+
+async def timer_loop(timer_id: str):
+    """Läuft im Hintergrund, aktualisiert alle 5 Sekunden das Countdown-Embed bis der Timer abläuft."""
+    try:
+        while True:
+            timers = timer_laden()
+            daten = timers.get(timer_id)
+            if daten is None or daten.get("beendet"):
+                return
+
+            guild = bot.get_guild(int(daten["guild_id"]))
+            channel = guild.get_channel(int(daten["channel_id"])) if guild else None
+
+            jetzt = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            rest_sekunden = daten["ende_timestamp"] - jetzt
+
+            if channel is not None:
+                try:
+                    nachricht = await channel.fetch_message(int(daten["message_id"]))
+                    if rest_sekunden <= 0:
+                        await nachricht.edit(embed=timer_embed_bauen(daten, 0, abgelaufen=True))
+                    else:
+                        await nachricht.edit(embed=timer_embed_bauen(daten, rest_sekunden))
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+
+            if rest_sekunden <= 0:
+                if channel is not None:
+                    try:
+                        await channel.send(
+                            f"⏰ <@{daten['ersteller_id']}> Dein Timer ist abgelaufen: **{daten['grund']}**"
+                        )
+                    except discord.HTTPException:
+                        pass
+
+                daten["beendet"] = True
+                timers[timer_id] = daten
+                timer_speichern(timers)
+                return
+
+            await asyncio.sleep(5)
+    finally:
+        timer_tasks.pop(timer_id, None)
+
+def timer_starten(timer_id: str):
+    """Startet den Hintergrund-Task für einen Timer (bricht einen evtl. bereits laufenden Task nicht doppelt)."""
+    if timer_id in timer_tasks:
+        return
+    task = bot.loop.create_task(timer_loop(timer_id))
+    timer_tasks[timer_id] = task
+
 def dauer_parsen(dauer_text: str) -> int:
     """Wandelt z.B. '30m', '2h', '1d' in Sekunden um."""
     einheiten = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -381,6 +485,13 @@ async def on_ready():
     # --- Drop-System nach einem Neustart automatisch fortsetzen, falls schon eingerichtet ---
     if drop_config_laden() is not None:
         drops_starten()
+
+    # --- Laufende Timer nach einem Neustart wiederherstellen ---
+    timers = timer_laden()
+    for t_id, daten in timers.items():
+        if daten.get("beendet"):
+            continue
+        timer_starten(t_id)
 
     try:
         synced = await bot.tree.sync()
@@ -691,6 +802,129 @@ async def drop_setup(
     # --- Beim allerersten Setup starten die Loops sofort -> erster Drop kommt direkt ---
     if not war_bereits_eingerichtet:
         drops_starten()
+
+# --- /timerglobal: Startet einen live runterzählenden Countdown-Timer in einem Channel ---
+@bot.tree.command(name="timerglobal", description="Startet einen Countdown-Timer in einem Channel")
+@app_commands.describe(
+    channel="In welchem Channel soll der Timer gepostet werden?",
+    grund="Warum läuft dieser Timer? (wird im Embed angezeigt)",
+    tage="Anzahl Tage (optional, Standard: 0)",
+    stunden="Anzahl Stunden (optional, Standard: 0)",
+    minuten="Anzahl Minuten (optional, Standard: 0)",
+    sekunden="Anzahl Sekunden (optional, Standard: 0)"
+)
+async def timerglobal(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    grund: str,
+    tage: int = 0,
+    stunden: int = 0,
+    minuten: int = 0,
+    sekunden: int = 0
+):
+    gesamt_sekunden = tage * 86400 + stunden * 3600 + minuten * 60 + sekunden
+
+    if gesamt_sekunden <= 0:
+        await interaction.response.send_message(
+            "⚠️ Bitte gib eine Dauer größer als 0 an (Tage/Stunden/Minuten/Sekunden).",
+            ephemeral=True
+        )
+        return
+
+    ende_zeit = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=gesamt_sekunden)
+    ende_unix = int(ende_zeit.timestamp())
+    timer_id = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))  # eindeutige ID
+
+    daten = {
+        "grund": grund,
+        "guild_id": str(interaction.guild.id),
+        "channel_id": str(channel.id),
+        "ersteller_id": str(interaction.user.id),
+        "ersteller_name": interaction.user.display_name,
+        "ende_timestamp": ende_unix,
+        "beendet": False,
+        "message_id": None
+    }
+
+    embed = timer_embed_bauen(daten, gesamt_sekunden)
+
+    try:
+        gesendete_nachricht = await channel.send(embed=embed)
+    except discord.HTTPException:
+        await interaction.response.send_message(
+            "⚠️ Ich konnte in diesem Channel keine Nachricht senden. Habe ich dort die nötigen Rechte?",
+            ephemeral=True
+        )
+        return
+
+    daten["message_id"] = str(gesendete_nachricht.id)
+
+    timers = timer_laden()
+    timers[timer_id] = daten
+    timer_speichern(timers)
+
+    timer_starten(timer_id)
+
+    await interaction.response.send_message(
+        f"✅ Timer gestartet in {channel.mention}! Endet <t:{ende_unix}:R>.",
+        ephemeral=True
+    )
+
+# --- /timerstop: Bricht einen laufenden Timer vorzeitig ab ---
+@bot.tree.command(name="timerstop", description="Bricht einen laufenden Timer über seine Nachrichten-ID ab")
+@app_commands.describe(nachricht_id="Die Nachrichten-ID des Timer-Embeds")
+async def timerstop(interaction: discord.Interaction, nachricht_id: str):
+    timers = timer_laden()
+    treffer = None
+    for t_id, daten in timers.items():
+        if daten.get("message_id") == nachricht_id:
+            treffer = (t_id, daten)
+            break
+
+    if treffer is None:
+        await interaction.response.send_message("⚠️ Kein Timer mit dieser Nachrichten-ID gefunden.", ephemeral=True)
+        return
+
+    t_id, daten = treffer
+
+    if daten.get("beendet"):
+        await interaction.response.send_message("⚠️ Dieser Timer ist bereits beendet.", ephemeral=True)
+        return
+
+    # --- Nur der Ersteller oder ein Admin darf den Timer abbrechen ---
+    ist_ersteller = str(interaction.user.id) == daten["ersteller_id"]
+    ist_admin = interaction.user.guild_permissions.administrator
+    if not (ist_ersteller or ist_admin):
+        await interaction.response.send_message(
+            "❌ Nur der Ersteller des Timers oder ein Admin kann ihn abbrechen.",
+            ephemeral=True
+        )
+        return
+
+    daten["beendet"] = True
+    timers[t_id] = daten
+    timer_speichern(timers)
+
+    task = timer_tasks.pop(t_id, None)
+    if task is not None:
+        task.cancel()
+
+    guild = bot.get_guild(int(daten["guild_id"]))
+    channel = guild.get_channel(int(daten["channel_id"])) if guild else None
+    if channel is not None:
+        try:
+            nachricht = await channel.fetch_message(int(daten["message_id"]))
+            abgebrochen_embed = discord.Embed(
+                title="🛑 Timer abgebrochen",
+                description=f"**{daten['grund']}**",
+                color=discord.Color.dark_grey()
+            )
+            abgebrochen_embed.set_footer(text=f"Abgebrochen von {interaction.user.display_name}")
+            await nachricht.edit(embed=abgebrochen_embed)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    await interaction.response.send_message("✅ Timer wurde abgebrochen.", ephemeral=True)
 
 # --- Bot starten ---
 bot.run(TOKEN)
