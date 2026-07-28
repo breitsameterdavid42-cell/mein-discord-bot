@@ -4,6 +4,8 @@ from discord import app_commands
 import os
 import random
 import json
+import asyncio
+import datetime
 
 # --- Rollenname, der /newvideo nutzen darf (muss EXAKT so heißen wie deine Rolle) ---
 ERLAUBTE_ROLLE = "⭐ᴄᴏɴᴛᴇɴᴛ ᴄʀᴇᴀᴛᴏʀ"
@@ -46,6 +48,30 @@ def event_config_laden():
 def event_config_speichern(link, channel_id):
     with open(EVENT_DATEI, "w") as f:
         json.dump({"link": link, "channel_id": channel_id}, f)
+
+# --- Speicherort für alle Giveaways (laufend + beendet) ---
+GIVEAWAY_DATEI = "giveaway_config.json"
+
+def giveaways_laden():
+    if os.path.exists(GIVEAWAY_DATEI):
+        with open(GIVEAWAY_DATEI, "r") as f:
+            return json.load(f)
+    return {}
+
+def giveaways_speichern(giveaways):
+    with open(GIVEAWAY_DATEI, "w") as f:
+        json.dump(giveaways, f)
+
+def dauer_parsen(dauer_text: str) -> int:
+    """Wandelt z.B. '30m', '2h', '1d' in Sekunden um."""
+    einheiten = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    dauer_text = dauer_text.strip().lower()
+    if len(dauer_text) < 2 or dauer_text[-1] not in einheiten:
+        raise ValueError("Ungültiges Zeitformat")
+    zahl = int(dauer_text[:-1])
+    if zahl <= 0:
+        raise ValueError("Zahl muss größer als 0 sein")
+    return zahl * einheiten[dauer_text[-1]]
 
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
@@ -156,12 +182,110 @@ class VoiceCreatorView(discord.ui.View):
                 ephemeral=True
             )
 
+# --- Giveaway Button-Logik ("Teilnehmen") ---
+class GiveawayView(discord.ui.View):
+    def __init__(self, giveaway_id: str, teilnehmer_anzahl: int = 0):
+        super().__init__(timeout=None)  # timeout=None = Button funktioniert dauerhaft, auch nach Neustart
+        self.giveaway_id = giveaway_id
+        # eindeutige custom_id pro Giveaway, damit mehrere gleichzeitig laufen können
+        self.teilnehmen.custom_id = f"giveaway_join_{giveaway_id}"
+        self.teilnehmen.label = f"Teilnehmen ({teilnehmer_anzahl})"
+
+    @discord.ui.button(label="Teilnehmen (0)", style=discord.ButtonStyle.success, emoji="🎉")
+    async def teilnehmen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaways = giveaways_laden()
+        daten = giveaways.get(self.giveaway_id)
+
+        if daten is None or daten.get("beendet"):
+            await interaction.response.send_message("⚠️ Dieses Giveaway ist bereits beendet.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        if user_id in daten["teilnehmer"]:
+            daten["teilnehmer"].remove(user_id)
+            nachricht_text = "❌ Du hast das Giveaway verlassen."
+        else:
+            daten["teilnehmer"].append(user_id)
+            nachricht_text = "✅ Du nimmst jetzt am Giveaway teil! Viel Glück! 🍀"
+
+        giveaways[self.giveaway_id] = daten
+        giveaways_speichern(giveaways)
+
+        button.label = f"Teilnehmen ({len(daten['teilnehmer'])})"
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(nachricht_text, ephemeral=True)
+
+async def giveaway_beenden(giveaway_id: str, warte_sekunden: float):
+    """Wartet bis zum Ende des Giveaways und lost dann automatisch einen Gewinner aus."""
+    if warte_sekunden > 0:
+        await asyncio.sleep(warte_sekunden)
+
+    giveaways = giveaways_laden()
+    daten = giveaways.get(giveaway_id)
+    if daten is None or daten.get("beendet"):
+        return
+
+    guild = bot.get_guild(int(daten["guild_id"]))
+    channel = guild.get_channel(int(daten["channel_id"])) if guild else None
+
+    nachricht = None
+    if channel is not None:
+        try:
+            nachricht = await channel.fetch_message(int(daten["message_id"]))
+        except (discord.NotFound, discord.HTTPException):
+            nachricht = None
+
+    teilnehmer_ids = daten["teilnehmer"]
+    if teilnehmer_ids:
+        gewinner_id = random.choice(teilnehmer_ids)
+        gewinner_text = f"<@{gewinner_id}>"
+    else:
+        gewinner_text = "Niemand hat teilgenommen 😢"
+
+    embed = discord.Embed(
+        title="🌊🎉 GIVEAWAY BEENDET 🎉🌊",
+        description=f"Das Giveaway ist vorbei! Danke an alle, die mitgemacht haben.",
+        color=discord.Color.from_rgb(0, 102, 204)
+    )
+    embed.add_field(name="🏆 Gewinn", value=f"```{daten['preis']}```", inline=False)
+    embed.add_field(name="🎊 Gewinner", value=gewinner_text, inline=False)
+    embed.add_field(name="👑 Host", value=f"<@{daten['host_id']}>", inline=False)
+    embed.set_footer(text=f"Teilnehmer insgesamt: {len(teilnehmer_ids)}")
+    if daten.get("bild"):
+        embed.set_thumbnail(url=daten["bild"])
+
+    if nachricht is not None:
+        try:
+            await nachricht.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+
+    if channel is not None:
+        await channel.send(
+            f"🎉 Herzlichen Glückwunsch {gewinner_text}! Du hast **{daten['preis']}** gewonnen! 🎉"
+        )
+
+    daten["beendet"] = True
+    giveaways[giveaway_id] = daten
+    giveaways_speichern(giveaways)
+
 # --- Wird ausgeführt, wenn der Bot online geht ---
 @bot.event
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user}")
     bot.add_view(RollenView())  # sorgt dafür, dass die Buttons auch nach Neustart klickbar bleiben
     bot.add_view(VoiceCreatorView())
+
+    # --- Laufende Giveaways nach einem Neustart wiederherstellen ---
+    giveaways = giveaways_laden()
+    jetzt = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    for g_id, daten in giveaways.items():
+        if daten.get("beendet"):
+            continue
+        bot.add_view(GiveawayView(g_id, len(daten["teilnehmer"])))
+        rest_sekunden = daten["ende_timestamp"] - jetzt
+        bot.loop.create_task(giveaway_beenden(g_id, max(rest_sekunden, 0)))
+
     try:
         synced = await bot.tree.sync()
         print(f"🔄 {len(synced)} Slash-Commands synchronisiert")
@@ -333,6 +457,98 @@ async def event(interaction: discord.Interaction, text: str):
 
     await channel.send(content=ping_text, embed=embed)
     await interaction.response.send_message(f"✅ Event in {channel.mention} gepostet!", ephemeral=True)
+
+# --- /giveaway: Startet ein neues Giveaway im Water-Style ---
+@bot.tree.command(name="giveaway", description="[Admin] Starte ein neues Giveaway")
+@app_commands.describe(
+    preis="Was gibt es zu gewinnen?",
+    dauer="Wie lange soll das Giveaway laufen? (z.B. 30m, 2h, 1d)",
+    ping_rolle="Rolle, die beim Start gepingt werden soll (optional)",
+    bild="Bild-URL, die im Giveaway angezeigt wird (optional)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def giveaway(
+    interaction: discord.Interaction,
+    preis: str,
+    dauer: str,
+    ping_rolle: discord.Role = None,
+    bild: str = None
+):
+    try:
+        sekunden = dauer_parsen(dauer)
+    except ValueError:
+        await interaction.response.send_message(
+            "⚠️ Ungültiges Zeitformat! Nutze z.B. `30m`, `2h` oder `1d`.",
+            ephemeral=True
+        )
+        return
+
+    ende_zeit = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=sekunden)
+    ende_unix = int(ende_zeit.timestamp())
+    giveaway_id = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000))  # eindeutige ID
+
+    # --- Embed im Water/Beach-Style ---
+    embed = discord.Embed(
+        title="🌊🎁 EPISCHES GIVEAWAY 🎁🌊",
+        description="Ein brandneues Event wurde gestartet! Mach mit und sichere dir die Chance auf einen fantastischen Gewinn.",
+        color=discord.Color.from_rgb(0, 153, 255)  # Water-Blau
+    )
+    embed.add_field(name="🏆 Gewinn", value=f"```{preis}```", inline=False)
+    embed.add_field(name="👑 Host", value=interaction.user.mention, inline=False)
+    embed.add_field(name="⏳ Ende", value=f"<t:{ende_unix}:R> (<t:{ende_unix}:f>)", inline=False)
+    embed.add_field(name="👇", value="*Klicke unten auf den Button, um in den Lostopf zu springen!*", inline=False)
+    embed.set_footer(text="Viel Glück an alle Teilnehmer!")
+    if bild:
+        embed.set_thumbnail(url=bild)
+
+    view = GiveawayView(giveaway_id, 0)
+    ping_text = ping_rolle.mention if ping_rolle else ""
+
+    await interaction.response.send_message(content=ping_text, embed=embed, view=view)
+    gesendete_nachricht = await interaction.original_response()
+
+    # --- Giveaway speichern, damit es auch nach einem Neustart weiterläuft ---
+    giveaways = giveaways_laden()
+    giveaways[giveaway_id] = {
+        "preis": preis,
+        "host_id": str(interaction.user.id),
+        "guild_id": str(interaction.guild.id),
+        "channel_id": str(interaction.channel.id),
+        "message_id": str(gesendete_nachricht.id),
+        "ende_timestamp": ende_unix,
+        "teilnehmer": [],
+        "beendet": False,
+        "bild": bild
+    }
+    giveaways_speichern(giveaways)
+
+    bot.loop.create_task(giveaway_beenden(giveaway_id, sekunden))
+
+# --- /giveaway-reroll: Lost bei einem beendeten Giveaway einen neuen Gewinner aus ---
+@bot.tree.command(name="giveaway-reroll", description="[Admin] Lost bei einem beendeten Giveaway einen neuen Gewinner aus")
+@app_commands.describe(nachricht_id="Die Nachrichten-ID des Giveaway-Embeds")
+@app_commands.checks.has_permissions(administrator=True)
+async def giveaway_reroll(interaction: discord.Interaction, nachricht_id: str):
+    giveaways = giveaways_laden()
+    treffer = None
+    for g_id, daten in giveaways.items():
+        if daten.get("message_id") == nachricht_id:
+            treffer = (g_id, daten)
+            break
+
+    if treffer is None:
+        await interaction.response.send_message("⚠️ Kein Giveaway mit dieser Nachrichten-ID gefunden.", ephemeral=True)
+        return
+
+    g_id, daten = treffer
+    if not daten["teilnehmer"]:
+        await interaction.response.send_message("⚠️ Es gab keine Teilnehmer bei diesem Giveaway.", ephemeral=True)
+        return
+
+    gewinner_id = random.choice(daten["teilnehmer"])
+    await interaction.response.send_message(
+        f"🎉 Neuer Gewinner für **{daten['preis']}**: <@{gewinner_id}>! Herzlichen Glückwunsch! 🎉"
+    )
 
 # --- Bot starten ---
 bot.run(TOKEN)
