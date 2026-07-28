@@ -49,6 +49,39 @@ def event_config_speichern(link, channel_id):
     with open(EVENT_DATEI, "w") as f:
         json.dump({"link": link, "channel_id": channel_id}, f)
 
+# --- Speicherort für die per /drop-setup eingerichtete Config ---
+DROP_DATEI = "drop_config.json"
+
+# --- Standard-Reaction-Emojis pro Tier (können teilweise überschrieben werden) ---
+STANDARD_EMOJIS = {
+    "honig": "🍯",
+    "episch": "⚡",
+    "mythic": "🔮",
+    "secret": "👑"
+}
+
+# --- Feste Werte pro Drop-Tier: Anzeigename, Wins, Intervall in Sekunden ---
+DROP_TIERS = {
+    "honig": {"name": "Honey Drop", "wins": 50, "intervall": 15 * 60, "farbe": 0xF5A623},
+    "episch": {"name": "Episch", "wins": 300, "intervall": 30 * 60, "farbe": 0x9B59B6},
+    "mythic": {"name": "Mythic", "wins": 500, "intervall": 60 * 60, "farbe": 0xE91E63},
+    "secret": {"name": "Secret", "wins": 800, "intervall": None, "farbe": 0x2C2F33},  # Intervall = zufällig 4-5h
+}
+
+def drop_config_laden():
+    if os.path.exists(DROP_DATEI):
+        with open(DROP_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def drop_config_speichern(config):
+    with open(DROP_DATEI, "w") as f:
+        json.dump(config, f)
+
+def drop_code_generieren() -> str:
+    """Erstellt einen zufälligen 4-stelligen Code, z.B. '0472'."""
+    return f"{random.randint(0, 9999):04d}"
+
 # --- Speicherort für alle Giveaways (laufend + beendet) ---
 GIVEAWAY_DATEI = "giveaway_config.json"
 
@@ -269,6 +302,65 @@ async def giveaway_beenden(giveaway_id: str, warte_sekunden: float):
     giveaways[giveaway_id] = daten
     giveaways_speichern(giveaways)
 
+# --- Drop-System: postet automatisch & dauerhaft Drops im eingestellten Intervall ---
+drop_tasks_gestartet = False  # verhindert, dass die Loops mehrfach gestartet werden
+
+async def drop_loop(tier_key: str):
+    """Läuft dauerhaft im Hintergrund: postet sofort einen Drop und danach im festen Intervall."""
+    tier = DROP_TIERS[tier_key]
+
+    while True:
+        config = drop_config_laden()
+
+        if config is None:
+            # Noch kein /drop-setup gemacht -> kurz warten und nochmal prüfen
+            await asyncio.sleep(30)
+            continue
+
+        channel_id = config.get("channel_id")
+        channel = bot.get_channel(int(channel_id)) if channel_id else None
+
+        if channel is not None:
+            rolle_id = config.get(f"{tier_key}_rolle_id")
+            rolle = channel.guild.get_role(int(rolle_id)) if rolle_id else None
+            ping_text = rolle.mention if rolle else ""
+
+            emoji = config.get(f"{tier_key}_emoji") or STANDARD_EMOJIS[tier_key]
+            code = drop_code_generieren()
+
+            embed = discord.Embed(
+                description=f"**{tier['name']}** is dropping now: **{tier['wins']} wins**!\nCode: `{code}`",
+                color=tier["farbe"]
+            )
+            embed.set_author(name="Drop Announcement")
+            embed.add_field(name=emoji, value=f"**{tier['wins']}**", inline=True)
+
+            try:
+                gesendete_nachricht = await channel.send(content=ping_text, embed=embed)
+                try:
+                    await gesendete_nachricht.add_reaction(emoji)
+                except discord.HTTPException:
+                    pass  # falls das Emoji ungültig ist, wird die Reaction einfach übersprungen
+            except discord.HTTPException:
+                pass
+
+        # --- Wartezeit bis zum nächsten Drop bestimmen ---
+        if tier_key == "secret":
+            wartezeit = random.uniform(4 * 3600, 5 * 3600)  # zufällig zwischen 4 und 5 Stunden
+        else:
+            wartezeit = tier["intervall"]
+
+        await asyncio.sleep(wartezeit)
+
+def drops_starten():
+    """Startet die 4 Hintergrund-Loops (Honey, Episch, Mythic, Secret) genau einmal."""
+    global drop_tasks_gestartet
+    if drop_tasks_gestartet:
+        return
+    drop_tasks_gestartet = True
+    for tier_key in DROP_TIERS:
+        bot.loop.create_task(drop_loop(tier_key))
+
 # --- Wird ausgeführt, wenn der Bot online geht ---
 @bot.event
 async def on_ready():
@@ -285,6 +377,10 @@ async def on_ready():
         bot.add_view(GiveawayView(g_id, len(daten["teilnehmer"])))
         rest_sekunden = daten["ende_timestamp"] - jetzt
         bot.loop.create_task(giveaway_beenden(g_id, max(rest_sekunden, 0)))
+
+    # --- Drop-System nach einem Neustart automatisch fortsetzen, falls schon eingerichtet ---
+    if drop_config_laden() is not None:
+        drops_starten()
 
     try:
         synced = await bot.tree.sync()
@@ -549,6 +645,52 @@ async def giveaway_reroll(interaction: discord.Interaction, nachricht_id: str):
     await interaction.response.send_message(
         f"🎉 Neuer Gewinner für **{daten['preis']}**: <@{gewinner_id}>! Herzlichen Glückwunsch! 🎉"
     )
+
+# --- /drop-setup: Admin richtet Channel + Ping-Rollen für das automatische Drop-System ein ---
+@bot.tree.command(name="drop-setup", description="[Admin] Richte die automatischen Drops ein (Honey/Episch/Mythic/Secret)")
+@app_commands.describe(
+    channel="In welchem Channel sollen die Drops gepostet werden?",
+    honig_rolle="Rolle, die bei Honey Drop (alle 15 Min) gepingt wird (optional)",
+    episch_rolle="Rolle, die bei Episch (alle 30 Min) gepingt wird (optional)",
+    mythic_rolle="Rolle, die bei Mythic (jede Stunde) gepingt wird (optional)",
+    secret_rolle="Rolle, die bei Secret (alle 4-5 Std.) gepingt wird (optional)",
+    secret_emoji="Reaction-Emoji für Secret Drops (optional, Standard: 👑)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def drop_setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    honig_rolle: discord.Role = None,
+    episch_rolle: discord.Role = None,
+    mythic_rolle: discord.Role = None,
+    secret_rolle: discord.Role = None,
+    secret_emoji: str = None
+):
+    war_bereits_eingerichtet = drop_config_laden() is not None
+
+    config = {
+        "channel_id": str(channel.id),
+        "honig_rolle_id": str(honig_rolle.id) if honig_rolle else None,
+        "episch_rolle_id": str(episch_rolle.id) if episch_rolle else None,
+        "mythic_rolle_id": str(mythic_rolle.id) if mythic_rolle else None,
+        "secret_rolle_id": str(secret_rolle.id) if secret_rolle else None,
+        "secret_emoji": secret_emoji  # None = Standard-Emoji (👑) wird verwendet
+    }
+    drop_config_speichern(config)
+
+    await interaction.response.send_message(
+        f"✅ Drop-System eingerichtet! Drops werden ab jetzt in {channel.mention} gepostet:\n"
+        f"🍯 Honey Drop – alle 15 Min. (50 Wins)\n"
+        f"⚡ Episch – alle 30 Min. (300 Wins)\n"
+        f"🔮 Mythic – jede Stunde (500 Wins)\n"
+        f"👑 Secret – alle 4-5 Std. (800 Wins)\n\n"
+        f"Der erste Drop von jedem Typ kommt jetzt sofort!",
+        ephemeral=True
+    )
+
+    # --- Beim allerersten Setup starten die Loops sofort -> erster Drop kommt direkt ---
+    if not war_bereits_eingerichtet:
+        drops_starten()
 
 # --- Bot starten ---
 bot.run(TOKEN)
