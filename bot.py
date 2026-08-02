@@ -210,6 +210,348 @@ def dauer_parsen(dauer_text: str) -> int:
         raise ValueError("Zahl muss größer als 0 sein")
     return zahl * einheiten[dauer_text[-1]]
 
+# =========================================================================
+# ================================ TICKETS ================================
+# =========================================================================
+
+# --- Speicherort für die per /newticketsystem eingerichtete Konfiguration ---
+TICKET_SETUP_DATEI = "ticket_setup.json"
+
+def ticket_setup_laden():
+    if os.path.exists(TICKET_SETUP_DATEI):
+        with open(TICKET_SETUP_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def ticket_setup_speichern(config):
+    with open(TICKET_SETUP_DATEI, "w") as f:
+        json.dump(config, f)
+
+# --- Speicherort für alle offenen/geschlossenen Ticket-Channels ---
+TICKET_DATEI = "ticket_tickets.json"
+
+def tickets_laden():
+    if os.path.exists(TICKET_DATEI):
+        with open(TICKET_DATEI, "r") as f:
+            return json.load(f)
+    return {}
+
+def tickets_speichern(tickets):
+    with open(TICKET_DATEI, "w") as f:
+        json.dump(tickets, f)
+
+def ticket_zaehler_erhoehen():
+    """Fortlaufende Nummer für Ticket-Channel-Namen, z.B. ticket-0007."""
+    setup = ticket_setup_laden() or {}
+    zaehler = setup.get("zaehler", 0) + 1
+    setup["zaehler"] = zaehler
+    ticket_setup_speichern(setup)
+    return zaehler
+
+# --- Panel mit den 4 auswählbaren Knöpfen ("Support" / "Report" / usw.) ---
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # timeout=None = Buttons funktionieren dauerhaft, auch nach Neustart
+        setup = ticket_setup_laden()
+        knoepfe = setup.get("knoepfe", []) if setup else []
+        for i, label in enumerate(knoepfe):
+            self.add_item(TicketOpenButton(i, label))
+
+class TicketOpenButton(discord.ui.Button):
+    def __init__(self, index: int, label: str):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary,
+            custom_id=f"ticket_open_{index}",  # muss eindeutig + dauerhaft sein
+            emoji="🎫"
+        )
+        self.index = index
+        self.button_label = label
+
+    async def callback(self, interaction: discord.Interaction):
+        await ticket_erstellen(interaction, self.button_label)
+
+async def ticket_erstellen(interaction: discord.Interaction, ticket_typ: str):
+    """Erstellt einen neuen privaten Ticket-Channel für den User, der den Knopf gedrückt hat."""
+    setup = ticket_setup_laden()
+    if setup is None:
+        await interaction.response.send_message(
+            "⚠️ Es wurde noch kein Ticket-System eingerichtet. Ein Admin muss zuerst `/newticketsystem` ausführen.",
+            ephemeral=True
+        )
+        return
+
+    kategorie = interaction.guild.get_channel(int(setup["kategorie_id"]))
+    if kategorie is None:
+        await interaction.response.send_message(
+            "⚠️ Die eingerichtete Kategorie existiert nicht mehr.",
+            ephemeral=True
+        )
+        return
+
+    mod_rolle = interaction.guild.get_role(int(setup["mod_rolle_id"]))
+
+    # --- Verhindern, dass ein User mehrere offene Tickets gleichzeitig hat ---
+    alle_tickets = tickets_laden()
+    for ch_id, daten in alle_tickets.items():
+        if daten["opener_id"] == str(interaction.user.id) and not daten.get("geschlossen"):
+            channel_vorhanden = interaction.guild.get_channel(int(ch_id))
+            if channel_vorhanden is not None:
+                await interaction.response.send_message(
+                    f"⚠️ Du hast bereits ein offenes Ticket: {channel_vorhanden.mention}",
+                    ephemeral=True
+                )
+                return
+
+    # --- Berechtigungen für den neuen Ticket-Channel ---
+    overwrites = {
+        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    if mod_rolle is not None:
+        overwrites[mod_rolle] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    nummer = ticket_zaehler_erhoehen()
+    channel_name = f"ticket-{nummer:04d}-{interaction.user.name}".lower().replace(" ", "-")[:90]
+
+    try:
+        neuer_channel = await interaction.guild.create_text_channel(
+            name=channel_name,
+            category=kategorie,
+            overwrites=overwrites,
+            topic=f"Ticket von {interaction.user.id} | Typ: {ticket_typ}"
+        )
+    except discord.HTTPException:
+        await interaction.response.send_message(
+            "⚠️ Der Ticket-Channel konnte nicht erstellt werden. Habe ich die nötigen Rechte?",
+            ephemeral=True
+        )
+        return
+
+    alle_tickets[str(neuer_channel.id)] = {
+        "opener_id": str(interaction.user.id),
+        "opener_name": str(interaction.user),
+        "guild_id": str(interaction.guild.id),
+        "typ": ticket_typ,
+        "beansprucht_von": None,
+        "geschlossen": False
+    }
+    tickets_speichern(alle_tickets)
+
+    embed = discord.Embed(
+        title=f"🎫 Ticket: {ticket_typ}",
+        description=(
+            f"Hallo {interaction.user.mention}! Ein Team-Mitglied kümmert sich gleich um dich.\n"
+            f"Beschreib dein Anliegen einfach hier im Chat.\n\n"
+            f"🙋 **Übernehmen** – ein Team-Mitglied holt sich das Ticket in den privaten Bereich.\n"
+            f"🔒 **Schließen** – schließt das Ticket, du bekommst den ganzen Chat per DM."
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"Geöffnet von {interaction.user}")
+
+    ping_text = mod_rolle.mention if mod_rolle else ""
+    await neuer_channel.send(content=f"{interaction.user.mention} {ping_text}", embed=embed, view=TicketActionView())
+
+    await interaction.response.send_message(
+        f"✅ Dein Ticket wurde erstellt: {neuer_channel.mention}",
+        ephemeral=True
+    )
+
+# --- Auswahlmenü, das erscheint, wenn 'Übergeben' gedrückt wird ---
+class TicketTransferSelectView(discord.ui.View):
+    """Nur Leute mit der Ticket-Mod-Rolle sind gültige Ziele für die Übergabe."""
+    def __init__(self, mod_rolle_id: int):
+        super().__init__(timeout=60)
+        self.mod_rolle_id = mod_rolle_id
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Wähle ein Team-Mitglied aus")
+    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        ziel_user = select.values[0]
+        mod_rolle = interaction.guild.get_role(self.mod_rolle_id)
+
+        if mod_rolle is None or mod_rolle not in getattr(ziel_user, "roles", []):
+            await interaction.response.send_message(
+                "⚠️ Diese Person hat nicht die Ticket-Mod-Rolle.",
+                ephemeral=True
+            )
+            return
+
+        tickets = tickets_laden()
+        daten = tickets.get(str(interaction.channel.id))
+        if daten is None or daten.get("geschlossen"):
+            await interaction.response.send_message("⚠️ Dieses Ticket existiert nicht mehr.", ephemeral=True)
+            return
+
+        alter_claimer_id = daten.get("beansprucht_von")
+
+        # --- alten Übernehmer die Sicht entziehen, neuen freischalten ---
+        if alter_claimer_id:
+            altes_mitglied = interaction.guild.get_member(int(alter_claimer_id))
+            if altes_mitglied is not None:
+                await interaction.channel.set_permissions(altes_mitglied, overwrite=None)
+
+        await interaction.channel.set_permissions(
+            ziel_user, view_channel=True, send_messages=True, read_message_history=True
+        )
+
+        daten["beansprucht_von"] = str(ziel_user.id)
+        tickets[str(interaction.channel.id)] = daten
+        tickets_speichern(tickets)
+
+        await interaction.response.edit_message(content=f"✅ Ticket an {ziel_user.mention} übergeben.", view=None)
+        await interaction.channel.send(f"🔁 Ticket wurde an {ziel_user.mention} übergeben.")
+
+# --- Buttons, die in jedem einzelnen Ticket-Channel angezeigt werden ---
+class TicketActionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # timeout=None = Buttons funktionieren dauerhaft, auch nach Neustart
+
+    @discord.ui.button(label="Übernehmen", style=discord.ButtonStyle.success, emoji="🙋", custom_id="ticket_claim")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        setup = ticket_setup_laden()
+        tickets = tickets_laden()
+        daten = tickets.get(str(interaction.channel.id))
+
+        if daten is None or daten.get("geschlossen"):
+            await interaction.response.send_message("⚠️ Dieses Ticket existiert nicht mehr.", ephemeral=True)
+            return
+
+        mod_rolle = interaction.guild.get_role(int(setup["mod_rolle_id"])) if setup else None
+        ist_admin = interaction.user.guild_permissions.administrator
+        ist_mod = mod_rolle is not None and mod_rolle in interaction.user.roles
+        if not (ist_mod or ist_admin):
+            await interaction.response.send_message(
+                "❌ Nur Personen mit der Ticket-Mod-Rolle können Tickets übernehmen.",
+                ephemeral=True
+            )
+            return
+
+        if daten.get("beansprucht_von"):
+            beanspruchendes_mitglied = interaction.guild.get_member(int(daten["beansprucht_von"]))
+            name = beanspruchendes_mitglied.mention if beanspruchendes_mitglied else "jemand anderem"
+            await interaction.response.send_message(f"⚠️ Dieses Ticket wird bereits von {name} bearbeitet.", ephemeral=True)
+            return
+
+        # --- Ticket in den privaten Bereich des Übernehmers ziehen ---
+        if mod_rolle is not None:
+            await interaction.channel.set_permissions(mod_rolle, view_channel=False)
+        await interaction.channel.set_permissions(
+            interaction.user, view_channel=True, send_messages=True, read_message_history=True
+        )
+
+        daten["beansprucht_von"] = str(interaction.user.id)
+        tickets[str(interaction.channel.id)] = daten
+        tickets_speichern(tickets)
+
+        embed = discord.Embed(
+            description=f"🙋 {interaction.user.mention} hat dieses Ticket übernommen. Nur du und {interaction.user.mention} sehen den Chat jetzt noch.",
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @discord.ui.button(label="Übergeben", style=discord.ButtonStyle.secondary, emoji="🔁", custom_id="ticket_transfer")
+    async def transfer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        setup = ticket_setup_laden()
+        tickets = tickets_laden()
+        daten = tickets.get(str(interaction.channel.id))
+
+        if daten is None or daten.get("geschlossen"):
+            await interaction.response.send_message("⚠️ Dieses Ticket existiert nicht mehr.", ephemeral=True)
+            return
+
+        if not daten.get("beansprucht_von"):
+            await interaction.response.send_message(
+                "⚠️ Das Ticket wurde noch von niemandem übernommen. Drück zuerst auf 'Übernehmen'.",
+                ephemeral=True
+            )
+            return
+
+        ist_admin = interaction.user.guild_permissions.administrator
+        ist_aktueller_claimer = str(interaction.user.id) == daten["beansprucht_von"]
+        if not (ist_aktueller_claimer or ist_admin):
+            await interaction.response.send_message(
+                "❌ Nur die Person, die das Ticket übernommen hat, kann es übergeben.",
+                ephemeral=True
+            )
+            return
+
+        if setup is None:
+            await interaction.response.send_message("⚠️ Ticket-System ist nicht eingerichtet.", ephemeral=True)
+            return
+
+        view = TicketTransferSelectView(int(setup["mod_rolle_id"]))
+        await interaction.response.send_message(
+            "Wähle die Person aus, an die das Ticket übergeben werden soll:",
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Schließen", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ticket_close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        setup = ticket_setup_laden()
+        tickets = tickets_laden()
+        daten = tickets.get(str(interaction.channel.id))
+
+        if daten is None or daten.get("geschlossen"):
+            await interaction.response.send_message("⚠️ Dieses Ticket existiert nicht mehr.", ephemeral=True)
+            return
+
+        mod_rolle = interaction.guild.get_role(int(setup["mod_rolle_id"])) if setup else None
+        ist_admin = interaction.user.guild_permissions.administrator
+        ist_mod = mod_rolle is not None and mod_rolle in interaction.user.roles
+        ist_opener = str(interaction.user.id) == daten["opener_id"]
+        ist_claimer = str(interaction.user.id) == (daten.get("beansprucht_von") or "")
+
+        if not (ist_admin or ist_mod or ist_opener or ist_claimer):
+            await interaction.response.send_message("❌ Du darfst dieses Ticket nicht schließen.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🔒 Ticket wird geschlossen und der Chat wird verschickt...")
+
+        # --- Ganzen Chatverlauf als Textdatei sammeln ---
+        zeilen = []
+        async for nachricht in interaction.channel.history(limit=None, oldest_first=True):
+            zeit = nachricht.created_at.strftime("%d.%m.%Y %H:%M")
+            inhalt = nachricht.content or "[kein Text / Anhang oder Embed]"
+            zeilen.append(f"[{zeit}] {nachricht.author}: {inhalt}")
+        transcript_text = "\n".join(zeilen) if zeilen else "(Keine Nachrichten)"
+
+        dateiname = f"transcript-{interaction.channel.name}.txt"
+        with open(dateiname, "w", encoding="utf-8") as f:
+            f.write(transcript_text)
+
+        # --- Transcript per DM an den Ersteller des Tickets schicken ---
+        guild = interaction.guild
+        opener = guild.get_member(int(daten["opener_id"]))
+        if opener is not None:
+            try:
+                dm_embed = discord.Embed(
+                    title="🔒 Dein Ticket wurde geschlossen",
+                    description=f"Anbei der komplette Chatverlauf deines Tickets **{daten['typ']}**.",
+                    color=discord.Color.dark_grey()
+                )
+                await opener.send(embed=dm_embed, file=discord.File(dateiname))
+            except discord.HTTPException:
+                pass  # z.B. wenn der User DMs deaktiviert hat
+
+        os.remove(dateiname)
+
+        daten["geschlossen"] = True
+        tickets[str(interaction.channel.id)] = daten
+        tickets_speichern(tickets)
+
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete()
+        except discord.HTTPException:
+            pass
+
+# =========================================================================
+# =========================== ENDE TICKET-SYSTEM ==========================
+# =========================================================================
+
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
 PREFIX = "!"  # Befehle starten z.B. mit !hallo
@@ -471,6 +813,8 @@ async def on_ready():
     print(f"✅ Eingeloggt als {bot.user}")
     bot.add_view(RollenView())  # sorgt dafür, dass die Buttons auch nach Neustart klickbar bleiben
     bot.add_view(VoiceCreatorView())
+    bot.add_view(TicketPanelView())  # Ticket-Panel-Knöpfe bleiben nach Neustart klickbar
+    bot.add_view(TicketActionView())  # Übernehmen/Übergeben/Schließen bleiben nach Neustart klickbar
 
     # --- Laufende Giveaways nach einem Neustart wiederherstellen ---
     giveaways = giveaways_laden()
@@ -925,6 +1269,63 @@ async def timerstop(interaction: discord.Interaction, nachricht_id: str):
             pass
 
     await interaction.response.send_message("✅ Timer wurde abgebrochen.", ephemeral=True)
+
+# --- /newticketsystem: Admin richtet das komplette Ticket-System ein und postet das Panel ---
+@bot.tree.command(name="newticketsystem", description="[Admin] Richtet das Ticket-System ein und postet das Panel mit 4 Knöpfen")
+@app_commands.describe(
+    channel="In welchem Channel soll das Ticket-Panel gepostet werden?",
+    titel="Titel des Panel-Embeds",
+    beschreibung="Beschreibungstext des Panel-Embeds",
+    kategorie="In welcher Kategorie sollen die Ticket-Channels erstellt werden?",
+    mod_rolle="Welche Rolle soll die Tickets sehen und bearbeiten können?",
+    bild="Bild-URL, die im Panel angezeigt wird (optional)",
+    knopf1="Beschriftung für Knopf 1 (Standard: Support)",
+    knopf2="Beschriftung für Knopf 2 (Standard: Report)",
+    knopf3="Beschriftung für Knopf 3 (Standard: Bug melden)",
+    knopf4="Beschriftung für Knopf 4 (Standard: Sonstiges)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def newticketsystem(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    titel: str,
+    beschreibung: str,
+    kategorie: discord.CategoryChannel,
+    mod_rolle: discord.Role,
+    bild: str = None,
+    knopf1: str = "Support",
+    knopf2: str = "Report",
+    knopf3: str = "Bug melden",
+    knopf4: str = "Sonstiges"
+):
+    knoepfe = [knopf1, knopf2, knopf3, knopf4]
+
+    bestehende_config = ticket_setup_laden() or {}
+    config = {
+        "kategorie_id": str(kategorie.id),
+        "mod_rolle_id": str(mod_rolle.id),
+        "panel_channel_id": str(channel.id),
+        "knoepfe": knoepfe,
+        "zaehler": bestehende_config.get("zaehler", 0)
+    }
+    ticket_setup_speichern(config)
+
+    embed = discord.Embed(
+        title=titel,
+        description=beschreibung,
+        color=discord.Color.blurple()
+    )
+    if bild:
+        embed.set_image(url=bild)
+
+    await channel.send(embed=embed, view=TicketPanelView())
+
+    await interaction.response.send_message(
+        f"✅ Ticket-System eingerichtet! Panel gepostet in {channel.mention}.\n"
+        f"Neue Tickets landen in **{kategorie.name}**, sichtbar für **{mod_rolle.name}**.\n"
+        f"Knöpfe: {', '.join(knoepfe)}",
+        ephemeral=True
+    )
 
 # --- Bot starten ---
 bot.run(TOKEN)
