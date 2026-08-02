@@ -552,6 +552,254 @@ class TicketActionView(discord.ui.View):
 # =========================== ENDE TICKET-SYSTEM ==========================
 # =========================================================================
 
+# =========================================================================
+# ================================ APPLY ===================================
+# =========================================================================
+
+# --- Speicherort für die per /apply-setup eingerichtete Konfiguration ---
+APPLY_SETUP_DATEI = "apply_setup.json"
+
+def apply_setup_laden():
+    if os.path.exists(APPLY_SETUP_DATEI):
+        with open(APPLY_SETUP_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def apply_setup_speichern(config):
+    with open(APPLY_SETUP_DATEI, "w") as f:
+        json.dump(config, f)
+
+# --- Speicherort für alle eingereichten Bewerbungen ---
+APPLY_DATEI = "apply_bewerbungen.json"
+
+def bewerbungen_laden():
+    if os.path.exists(APPLY_DATEI):
+        with open(APPLY_DATEI, "r") as f:
+            return json.load(f)
+    return {}
+
+def bewerbungen_speichern(bewerbungen):
+    with open(APPLY_DATEI, "w") as f:
+        json.dump(bewerbungen, f)
+
+def apply_zaehler_erhoehen():
+    """Fortlaufende ID für jede neue Bewerbung."""
+    setup = apply_setup_laden() or {}
+    zaehler = setup.get("zaehler", 0) + 1
+    setup["zaehler"] = zaehler
+    apply_setup_speichern(setup)
+    return zaehler
+
+MAX_APPLY_FRAGEN = 20
+
+# --- Panel mit dem "Apply starten"-Knopf ---
+class ApplyPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # timeout=None = Button funktioniert dauerhaft, auch nach Neustart
+
+    @discord.ui.button(label="Apply starten", style=discord.ButtonStyle.success, emoji="📋", custom_id="apply_start")
+    async def apply_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        setup = apply_setup_laden()
+        if setup is None or not setup.get("fragen"):
+            await interaction.response.send_message(
+                "⚠️ Es sind noch keine Fragen eingerichtet. Ein Admin muss zuerst `/apply-frage-hinzufuegen` nutzen.",
+                ephemeral=True
+            )
+            return
+
+        # --- Verhindern, dass jemand mehrere offene Bewerbungen gleichzeitig hat ---
+        alle_bewerbungen = bewerbungen_laden()
+        for b_id, daten in alle_bewerbungen.items():
+            if daten["opener_id"] == str(interaction.user.id) and daten.get("status") == "offen":
+                await interaction.response.send_message(
+                    "⚠️ Du hast bereits eine laufende Bewerbung. Beantworte zuerst die Fragen in deinen DMs.",
+                    ephemeral=True
+                )
+                return
+
+        try:
+            dm_channel = await interaction.user.create_dm()
+            await dm_channel.send(embed=discord.Embed(
+                title="📋 Bewerbung gestartet",
+                description=(
+                    f"Du beantwortest jetzt **{len(setup['fragen'])} Fragen**.\n"
+                    f"Schreib deine Antwort einfach hier in den Chat. Du hast pro Frage **10 Minuten** Zeit."
+                ),
+                color=discord.Color.blurple()
+            ))
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "⚠️ Ich konnte dir keine DM schicken. Bitte aktiviere private Nachrichten von Servermitgliedern und versuch es erneut.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "✅ Ich hab dir eine DM geschickt! Beantworte dort die Fragen.",
+            ephemeral=True
+        )
+
+        bot.loop.create_task(apply_ablauf_durchfuehren(interaction.user, interaction.guild.id, dm_channel, setup["fragen"]))
+
+async def apply_ablauf_durchfuehren(user: discord.User, guild_id: int, dm_channel: discord.DMChannel, fragen: list[str]):
+    """Stellt dem User nacheinander alle Fragen per DM und wartet jeweils auf seine Antwort."""
+    def check(nachricht: discord.Message) -> bool:
+        return nachricht.author.id == user.id and isinstance(nachricht.channel, discord.DMChannel)
+
+    antworten = []
+    for i, frage in enumerate(fragen, start=1):
+        await dm_channel.send(embed=discord.Embed(
+            title=f"Frage {i}/{len(fragen)}",
+            description=frage,
+            color=discord.Color.blue()
+        ))
+        try:
+            antwort_nachricht = await bot.wait_for("message", check=check, timeout=600)
+        except asyncio.TimeoutError:
+            await dm_channel.send(
+                "⏰ Zeit abgelaufen. Deine Bewerbung wurde abgebrochen. Du kannst jederzeit über den Button erneut starten."
+            )
+            return
+        antworten.append(antwort_nachricht.content or "[kein Text / nur Anhang]")
+
+    setup = apply_setup_laden()
+    if setup is None:
+        await dm_channel.send("⚠️ Die Bewerbung konnte nicht gespeichert werden, da das System nicht mehr eingerichtet ist.")
+        return
+
+    guild = bot.get_guild(guild_id)
+    review_channel = guild.get_channel(int(setup["review_channel_id"])) if guild else None
+
+    bewerbung_id = str(apply_zaehler_erhoehen())
+    bewerbungen = bewerbungen_laden()
+    bewerbungen[bewerbung_id] = {
+        "opener_id": str(user.id),
+        "opener_name": str(user),
+        "guild_id": str(guild_id),
+        "fragen": fragen,
+        "antworten": antworten,
+        "status": "offen",
+        "message_id": None,
+        "review_channel_id": setup["review_channel_id"]
+    }
+
+    embed = discord.Embed(
+        title=f"📋 Neue Bewerbung von {user}",
+        color=discord.Color.orange()
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    for i, (frage, antwort) in enumerate(zip(fragen, antworten), start=1):
+        embed.add_field(name=f"{i}. {frage}", value=antwort[:1024], inline=False)
+    embed.set_footer(text=f"User-ID: {user.id} | Bewerbung #{bewerbung_id}")
+
+    if review_channel is not None:
+        try:
+            gesendete_nachricht = await review_channel.send(embed=embed, view=ApplyReviewView(bewerbung_id))
+            bewerbungen[bewerbung_id]["message_id"] = str(gesendete_nachricht.id)
+        except discord.HTTPException:
+            pass
+
+    bewerbungen_speichern(bewerbungen)
+
+    await dm_channel.send(embed=discord.Embed(
+        title="✅ Bewerbung eingereicht!",
+        description="Danke für deine Antworten. Dein Team wird sich bald bei dir melden.",
+        color=discord.Color.green()
+    ))
+
+# --- Angenommen/Abgelehnt-Buttons unter jeder Bewerbung im Review-Channel ---
+class ApplyReviewView(discord.ui.View):
+    def __init__(self, bewerbung_id: str):
+        super().__init__(timeout=None)  # timeout=None = Buttons funktionieren dauerhaft, auch nach Neustart
+        self.bewerbung_id = bewerbung_id
+        self.annehmen.custom_id = f"apply_accept_{bewerbung_id}"
+        self.ablehnen.custom_id = f"apply_decline_{bewerbung_id}"
+
+    async def _bewerbung_pruefen(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ Nur Admins können Bewerbungen annehmen oder ablehnen.",
+                ephemeral=True
+            )
+            return None
+
+        bewerbungen = bewerbungen_laden()
+        daten = bewerbungen.get(self.bewerbung_id)
+        if daten is None:
+            await interaction.response.send_message("⚠️ Diese Bewerbung wurde nicht gefunden.", ephemeral=True)
+            return None
+        if daten.get("status") != "offen":
+            await interaction.response.send_message("⚠️ Über diese Bewerbung wurde bereits entschieden.", ephemeral=True)
+            return None
+        return daten
+
+    @discord.ui.button(label="Angenommen", style=discord.ButtonStyle.success, emoji="✅", custom_id="apply_accept_placeholder")
+    async def annehmen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        daten = await self._bewerbung_pruefen(interaction)
+        if daten is None:
+            return
+
+        setup = apply_setup_laden()
+        rolle = interaction.guild.get_role(int(setup["accept_rolle_id"])) if setup else None
+        mitglied = interaction.guild.get_member(int(daten["opener_id"]))
+
+        if rolle is not None and mitglied is not None:
+            try:
+                await mitglied.add_roles(rolle)
+            except discord.HTTPException:
+                pass
+
+        bewerbungen = bewerbungen_laden()
+        daten["status"] = "angenommen"
+        bewerbungen[self.bewerbung_id] = daten
+        bewerbungen_speichern(bewerbungen)
+
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green()
+        embed.add_field(name="Status", value=f"✅ Angenommen von {interaction.user.mention}", inline=False)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+        if mitglied is not None:
+            try:
+                await mitglied.send(embed=discord.Embed(
+                    title="✅ Deine Bewerbung wurde angenommen!",
+                    description=f"Herzlichen Glückwunsch! Du hast jetzt die Rolle **{rolle.name if rolle else ''}** erhalten.",
+                    color=discord.Color.green()
+                ))
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Abgelehnt", style=discord.ButtonStyle.danger, emoji="❌", custom_id="apply_decline_placeholder")
+    async def ablehnen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        daten = await self._bewerbung_pruefen(interaction)
+        if daten is None:
+            return
+
+        bewerbungen = bewerbungen_laden()
+        daten["status"] = "abgelehnt"
+        bewerbungen[self.bewerbung_id] = daten
+        bewerbungen_speichern(bewerbungen)
+
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.red()
+        embed.add_field(name="Status", value=f"❌ Abgelehnt von {interaction.user.mention}", inline=False)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+        mitglied = interaction.guild.get_member(int(daten["opener_id"]))
+        if mitglied is not None:
+            try:
+                await mitglied.send(embed=discord.Embed(
+                    title="❌ Deine Bewerbung wurde abgelehnt",
+                    description="Schade, diesmal hat es nicht geklappt. Du kannst dich in Zukunft gerne erneut bewerben.",
+                    color=discord.Color.red()
+                ))
+            except discord.HTTPException:
+                pass
+
+# =========================================================================
+# ============================= ENDE APPLY =================================
+# =========================================================================
+
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
 PREFIX = "!"  # Befehle starten z.B. mit !hallo
@@ -815,6 +1063,13 @@ async def on_ready():
     bot.add_view(VoiceCreatorView())
     bot.add_view(TicketPanelView())  # Ticket-Panel-Knöpfe bleiben nach Neustart klickbar
     bot.add_view(TicketActionView())  # Übernehmen/Übergeben/Schließen bleiben nach Neustart klickbar
+    bot.add_view(ApplyPanelView())  # "Apply starten"-Knopf bleibt nach Neustart klickbar
+
+    # --- Offene Bewerbungen nach einem Neustart wiederherstellen, damit die Buttons noch reagieren ---
+    bewerbungen = bewerbungen_laden()
+    for b_id, daten in bewerbungen.items():
+        if daten.get("status") == "offen":
+            bot.add_view(ApplyReviewView(b_id))
 
     # --- Laufende Giveaways nach einem Neustart wiederherstellen ---
     giveaways = giveaways_laden()
@@ -1326,6 +1581,155 @@ async def newticketsystem(
         f"Knöpfe: {', '.join(knoepfe)}",
         ephemeral=True
     )
+
+# =========================================================================
+# =========================== APPLY-COMMANDS ===============================
+# =========================================================================
+
+# --- /apply-setup: Admin richtet Titel, Beschreibung, Channels und die Annahme-Rolle ein ---
+@bot.tree.command(name="apply-setup", description="[Admin] Richtet das Apply-System ein und postet das Panel")
+@app_commands.describe(
+    channel="In welchem Channel soll der 'Apply starten'-Knopf gepostet werden?",
+    titel="Titel des Panel-Embeds",
+    beschreibung="Beschreibungstext des Panel-Embeds",
+    review_channel="In welchem Channel sollen fertige Bewerbungen erscheinen?",
+    rolle="Welche Rolle wird bei Annahme vergeben?",
+    bild="Bild-URL, die im Panel angezeigt wird (optional)",
+    knopf_text="Beschriftung des Buttons (Standard: Apply starten)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    titel: str,
+    beschreibung: str,
+    review_channel: discord.TextChannel,
+    rolle: discord.Role,
+    bild: str = None,
+    knopf_text: str = "Apply starten"
+):
+    bestehende_config = apply_setup_laden() or {}
+    config = {
+        "panel_channel_id": str(channel.id),
+        "review_channel_id": str(review_channel.id),
+        "accept_rolle_id": str(rolle.id),
+        "titel": titel,
+        "beschreibung": beschreibung,
+        "bild": bild,
+        "knopf_text": knopf_text,
+        "fragen": bestehende_config.get("fragen", []),
+        "zaehler": bestehende_config.get("zaehler", 0)
+    }
+    apply_setup_speichern(config)
+
+    embed = discord.Embed(title=titel, description=beschreibung, color=discord.Color.blurple())
+    if bild:
+        embed.set_image(url=bild)
+
+    view = ApplyPanelView()
+    view.apply_start.label = knopf_text
+    await channel.send(embed=embed, view=view)
+
+    anzahl_fragen = len(config["fragen"])
+    hinweis = "" if anzahl_fragen > 0 else "\n⚠️ Es sind noch keine Fragen eingerichtet! Nutze `/apply-frage-hinzufuegen`."
+    await interaction.response.send_message(
+        f"✅ Apply-System eingerichtet! Panel gepostet in {channel.mention}.\n"
+        f"Fertige Bewerbungen landen in {review_channel.mention}.\n"
+        f"Bei Annahme wird die Rolle **{rolle.name}** vergeben.\n"
+        f"Aktuell eingerichtete Fragen: **{anzahl_fragen}**{hinweis}",
+        ephemeral=True
+    )
+
+# --- /apply-frage-hinzufuegen: Admin fügt eine einzelne Frage hinzu (bis zu 20) ---
+@bot.tree.command(name="apply-frage-hinzufuegen", description="[Admin] Fügt eine Frage zur Bewerbung hinzu (max. 20)")
+@app_commands.describe(frage="Der Text der Frage")
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_frage_hinzufuegen(interaction: discord.Interaction, frage: str):
+    setup = apply_setup_laden()
+    if setup is None:
+        await interaction.response.send_message(
+            "⚠️ Richte zuerst `/apply-setup` ein, bevor du Fragen hinzufügst.",
+            ephemeral=True
+        )
+        return
+
+    fragen = setup.get("fragen", [])
+    if len(fragen) >= MAX_APPLY_FRAGEN:
+        await interaction.response.send_message(
+            f"⚠️ Es sind bereits {MAX_APPLY_FRAGEN} Fragen eingerichtet (Maximum erreicht).",
+            ephemeral=True
+        )
+        return
+
+    fragen.append(frage)
+    setup["fragen"] = fragen
+    apply_setup_speichern(setup)
+
+    await interaction.response.send_message(
+        f"✅ Frage **{len(fragen)}/{MAX_APPLY_FRAGEN}** hinzugefügt:\n> {frage}",
+        ephemeral=True
+    )
+
+# --- /apply-fragen-anzeigen: Zeigt alle aktuell eingerichteten Fragen ---
+@bot.tree.command(name="apply-fragen-anzeigen", description="[Admin] Zeigt alle eingerichteten Bewerbungsfragen")
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_fragen_anzeigen(interaction: discord.Interaction):
+    setup = apply_setup_laden()
+    fragen = setup.get("fragen", []) if setup else []
+
+    if not fragen:
+        await interaction.response.send_message("⚠️ Es sind noch keine Fragen eingerichtet.", ephemeral=True)
+        return
+
+    text = "\n".join(f"**{i}.** {f}" for i, f in enumerate(fragen, start=1))
+    embed = discord.Embed(title=f"📋 Bewerbungsfragen ({len(fragen)}/{MAX_APPLY_FRAGEN})", description=text, color=discord.Color.blurple())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- /apply-frage-entfernen: Entfernt eine Frage anhand ihrer Nummer ---
+@bot.tree.command(name="apply-frage-entfernen", description="[Admin] Entfernt eine Bewerbungsfrage anhand ihrer Nummer")
+@app_commands.describe(nummer="Die Nummer der Frage (siehe /apply-fragen-anzeigen)")
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_frage_entfernen(interaction: discord.Interaction, nummer: int):
+    setup = apply_setup_laden()
+    fragen = setup.get("fragen", []) if setup else []
+
+    if not fragen or nummer < 1 or nummer > len(fragen):
+        await interaction.response.send_message("⚠️ Ungültige Nummer. Nutze `/apply-fragen-anzeigen`, um die Nummern zu sehen.", ephemeral=True)
+        return
+
+    entfernt = fragen.pop(nummer - 1)
+    setup["fragen"] = fragen
+    apply_setup_speichern(setup)
+
+    await interaction.response.send_message(f"✅ Frage entfernt: \n> {entfernt}", ephemeral=True)
+
+# --- /apply-panel-posten: Postet das Panel erneut (z.B. nach Änderungen an den Fragen) ---
+@bot.tree.command(name="apply-panel-posten", description="[Admin] Postet das Apply-Panel erneut im eingerichteten Channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_panel_posten(interaction: discord.Interaction):
+    setup = apply_setup_laden()
+    if setup is None:
+        await interaction.response.send_message("⚠️ Richte zuerst `/apply-setup` ein.", ephemeral=True)
+        return
+
+    channel = interaction.guild.get_channel(int(setup["panel_channel_id"]))
+    if channel is None:
+        await interaction.response.send_message("⚠️ Der eingerichtete Panel-Channel existiert nicht mehr.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=setup["titel"], description=setup["beschreibung"], color=discord.Color.blurple())
+    if setup.get("bild"):
+        embed.set_image(url=setup["bild"])
+
+    view = ApplyPanelView()
+    view.apply_start.label = setup.get("knopf_text", "Apply starten")
+    await channel.send(embed=embed, view=view)
+
+    await interaction.response.send_message(f"✅ Panel erneut gepostet in {channel.mention}.", ephemeral=True)
+
+# =========================================================================
+# ========================= ENDE APPLY-COMMANDS ============================
+# =========================================================================
 
 # --- Bot starten ---
 bot.run(TOKEN)
