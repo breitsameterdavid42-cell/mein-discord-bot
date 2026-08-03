@@ -1721,6 +1721,50 @@ async def event(interaction: discord.Interaction, text: str):
     await channel.send(content=ping_text, embed=embed)
     await interaction.response.send_message(f"✅ Event in {channel.mention} gepostet!", ephemeral=True)
 
+# =========================================================================
+# ============================ ACTIVITY CHECK ================================
+# =========================================================================
+
+# --- Speicherort für den aktuellen Activity-Check-Tag (zählt automatisch hoch) ---
+CHECK_CONFIG_DATEI = "check_config.json"
+
+def check_config_laden():
+    if os.path.exists(CHECK_CONFIG_DATEI):
+        with open(CHECK_CONFIG_DATEI, "r") as f:
+            return json.load(f)
+    return {"tag": 0}
+
+def check_config_speichern(config):
+    with open(CHECK_CONFIG_DATEI, "w") as f:
+        json.dump(config, f)
+
+# --- /check: postet den nächsten Activity-Check-Tag und reagiert automatisch mit ✅ ---
+@bot.tree.command(name="check", description="[Admin] Postet den nächsten Activity Check (Tag zählt automatisch hoch)")
+@app_commands.checks.has_permissions(administrator=True)
+async def check(interaction: discord.Interaction):
+    config = check_config_laden()
+    config["tag"] = config.get("tag", 0) + 1
+    tag = config["tag"]
+    check_config_speichern(config)
+
+    embed = discord.Embed(
+        title=f"✅ ACTIVITY CHECK — DAY {tag}",
+        description=(
+            "Thank you for being on the server!\n\n"
+            "Please check in by simply reacting with ✅ below to confirm you're still active."
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"Activity Check Day {tag}")
+
+    await interaction.response.send_message(embed=embed)
+    gesendete_nachricht = await interaction.original_response()
+    await gesendete_nachricht.add_reaction("✅")
+
+# =========================================================================
+# ========================= ENDE ACTIVITY CHECK ==============================
+# =========================================================================
+
 # --- /giveaway: Startet ein neues Giveaway im Water-Style ---
 @bot.tree.command(name="giveaway", description="[Admin] Starte ein neues Giveaway")
 @app_commands.describe(
