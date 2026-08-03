@@ -1011,8 +1011,11 @@ def ki_usage_speichern(usage):
 KI_FREI_LIMIT = 10                   # so viele Scripts darf ein Nicht-VIP machen...
 KI_COOLDOWN_SEKUNDEN = 2 * 60 * 60    # ...bevor er 2 Stunden warten muss
 
-# --- API-Key kommt aus einer Umgebungsvariable (z.B. bei Railway eingetragen), NIE fest im Code eintragen ---
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# --- Pollinations.ai: kostenloser Text-KI-Anbieter, funktioniert OHNE bezahlten API-Key.
+#     Optional kann man sich auf https://enter.pollinations.ai einen KOSTENLOSEN Key holen (kein Guthaben,
+#     keine Kreditkarte nötig) - macht die Antworten nur zuverlässiger/schneller. Ohne Key läuft es trotzdem.
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")  # optional, darf leer bleiben
+POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "openai")  # z.B. "openai", "qwen-coder", "mistral"
 
 def ki_ist_vip(member: discord.Member) -> bool:
     """Prüft, ob ein Mitglied die VIP-Rolle aus /vipauto besitzt (dann unbegrenzte KI-Nutzung)."""
@@ -1023,7 +1026,7 @@ def ki_ist_vip(member: discord.Member) -> bool:
     return rolle is not None and rolle in member.roles
 
 async def ki_script_generieren(beschreibung: str) -> str:
-    """Ruft die Anthropic API auf und lässt einen Roblox-Studio-Lua-Script anhand der Beschreibung erstellen."""
+    """Nutzt die kostenlose Pollinations-Text-API, um einen Roblox-Studio-Lua-Script zu erstellen."""
     system_prompt = (
         "You are an expert Roblox Studio scripting assistant. The user will describe what they want "
         "a Roblox Studio Lua script to do. Respond with ONLY a single, complete, working Lua script "
@@ -1033,30 +1036,31 @@ async def ki_script_generieren(beschreibung: str) -> str:
         "Script/LocalScript and where it should be placed. Do not add any other explanation."
     )
     payload = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 1500,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": beschreibung}]
+        "model": POLLINATIONS_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": beschreibung}
+        ]
     }
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
+    headers = {"content-type": "application/json"}
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://text.pollinations.ai/openai",
             json=payload,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=60)
         ) as resp:
             if resp.status != 200:
                 fehler_text = await resp.text()
-                raise RuntimeError(f"Anthropic API Fehler {resp.status}: {fehler_text[:200]}")
+                raise RuntimeError(f"KI-Anbieter Fehler {resp.status}: {fehler_text[:200]}")
             daten = await resp.json()
-            teile = daten.get("content", [])
-            text = "".join(t.get("text", "") for t in teile if t.get("type") == "text")
-            return text.strip()
+            try:
+                return daten["choices"][0]["message"]["content"].strip()
+            except (KeyError, IndexError, TypeError):
+                raise RuntimeError("Unerwartetes Antwortformat vom KI-Anbieter.")
 
 async def ki_ablauf(message: discord.Message, beschreibung: str):
     """Ablauf für '?ki <Beschreibung>': generiert per KI einen Roblox-Studio-Script und postet ihn."""
@@ -1064,13 +1068,6 @@ async def ki_ablauf(message: discord.Message, beschreibung: str):
         await message.channel.send(
             f"⚠️ {message.author.mention} Bitte beschreibe, was der Script machen soll. "
             f"Beispiel: `?ki mach ein part unsichtbar wenn man es anklickt`",
-            delete_after=15
-        )
-        return
-
-    if not ANTHROPIC_API_KEY:
-        await message.channel.send(
-            "⚠️ Die KI ist noch nicht eingerichtet (fehlender API-Key). Bitte einen Admin kontaktieren.",
             delete_after=15
         )
         return
@@ -2249,7 +2246,8 @@ async def creatki(interaction: discord.Interaction, channel: discord.TextChannel
         f"> `?ki mach ein part unsichtbar wenn man es anklickt`\n"
         f"📊 Kostenlos: **{KI_FREI_LIMIT} Scripts** pro Spieler, danach **2 Stunden** Cooldown.\n"
         f"👑 VIP (unbegrenzt) erhält man über `?Vip` im selben Channel – geprüft wird der Game Pass "
-        f"aus `/vipauto` (Roblox-Account vorher mit `?VerfyRoblox` verknüpfen).",
+        f"aus `/vipauto` (Roblox-Account vorher mit `?VerfyRoblox` verknüpfen).\n"
+        f"🆓 Die KI läuft über einen kostenlosen Anbieter, es wird **kein bezahlter API-Key** benötigt.",
         ephemeral=True
     )
 
