@@ -979,6 +979,187 @@ async def vip_verfy_ablauf(message: discord.Message):
 # =========================================================================
 
 # =========================================================================
+# ========================= KI SCRIPT GENERATOR ============================
+# =========================================================================
+
+# --- Speicherort für den per /creatki eingerichteten KI-Channel ---
+KI_CONFIG_DATEI = "ki_config.json"
+
+def ki_config_laden():
+    if os.path.exists(KI_CONFIG_DATEI):
+        with open(KI_CONFIG_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def ki_config_speichern(config):
+    with open(KI_CONFIG_DATEI, "w") as f:
+        json.dump(config, f)
+
+# --- Speicherort für die Nutzung pro Spieler (Anzahl Scripts + Cooldown) ---
+KI_USAGE_DATEI = "ki_usage.json"
+
+def ki_usage_laden():
+    if os.path.exists(KI_USAGE_DATEI):
+        with open(KI_USAGE_DATEI, "r") as f:
+            return json.load(f)
+    return {}
+
+def ki_usage_speichern(usage):
+    with open(KI_USAGE_DATEI, "w") as f:
+        json.dump(usage, f)
+
+KI_FREI_LIMIT = 10                   # so viele Scripts darf ein Nicht-VIP machen...
+KI_COOLDOWN_SEKUNDEN = 2 * 60 * 60    # ...bevor er 2 Stunden warten muss
+
+# --- API-Key kommt aus einer Umgebungsvariable (z.B. bei Railway eingetragen), NIE fest im Code eintragen ---
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+def ki_ist_vip(member: discord.Member) -> bool:
+    """Prüft, ob ein Mitglied die VIP-Rolle aus /vipauto besitzt (dann unbegrenzte KI-Nutzung)."""
+    vip_config = vip_config_laden()
+    if vip_config is None or not vip_config.get("rolle_id"):
+        return False
+    rolle = member.guild.get_role(int(vip_config["rolle_id"]))
+    return rolle is not None and rolle in member.roles
+
+async def ki_script_generieren(beschreibung: str) -> str:
+    """Ruft die Anthropic API auf und lässt einen Roblox-Studio-Lua-Script anhand der Beschreibung erstellen."""
+    system_prompt = (
+        "You are an expert Roblox Studio scripting assistant. The user will describe what they want "
+        "a Roblox Studio Lua script to do. Respond with ONLY a single, complete, working Lua script "
+        "wrapped in a ```lua code block, using correct Roblox APIs (game:GetService, Instance.new, "
+        "CollectionService, RemoteEvents where sensible, etc). Add short inline comments explaining key "
+        "steps. Mention briefly at the very end (outside the code block, one line) whether it's a "
+        "Script/LocalScript and where it should be placed. Do not add any other explanation."
+    )
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 1500,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": beschreibung}]
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            if resp.status != 200:
+                fehler_text = await resp.text()
+                raise RuntimeError(f"Anthropic API Fehler {resp.status}: {fehler_text[:200]}")
+            daten = await resp.json()
+            teile = daten.get("content", [])
+            text = "".join(t.get("text", "") for t in teile if t.get("type") == "text")
+            return text.strip()
+
+async def ki_ablauf(message: discord.Message, beschreibung: str):
+    """Ablauf für '?ki <Beschreibung>': generiert per KI einen Roblox-Studio-Script und postet ihn."""
+    if not beschreibung:
+        await message.channel.send(
+            f"⚠️ {message.author.mention} Bitte beschreibe, was der Script machen soll. "
+            f"Beispiel: `?ki mach ein part unsichtbar wenn man es anklickt`",
+            delete_after=15
+        )
+        return
+
+    if not ANTHROPIC_API_KEY:
+        await message.channel.send(
+            "⚠️ Die KI ist noch nicht eingerichtet (fehlender API-Key). Bitte einen Admin kontaktieren.",
+            delete_after=15
+        )
+        return
+
+    user_id = str(message.author.id)
+    ist_vip = ki_ist_vip(message.author)
+
+    usage = ki_usage_laden()
+    eintrag = usage.get(user_id, {"anzahl": 0, "cooldown_bis": None})
+
+    jetzt = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+    if not ist_vip:
+        # --- Cooldown abgelaufen? Dann zurücksetzen, Spieler bekommt wieder 10 freie Scripts ---
+        if eintrag.get("cooldown_bis") and jetzt >= eintrag["cooldown_bis"]:
+            eintrag = {"anzahl": 0, "cooldown_bis": None}
+
+        # --- Noch im Cooldown? -> Englische Nachricht, wie gewünscht ---
+        if eintrag.get("cooldown_bis") and jetzt < eintrag["cooldown_bis"]:
+            rest = int(eintrag["cooldown_bis"] - jetzt)
+            stunden, rest_sek = divmod(rest, 3600)
+            minuten, _ = divmod(rest_sek, 60)
+            await message.channel.send(
+                f"⏰ {message.author.mention} You have a timer of **{stunden}h {minuten}m** before you can "
+                f"use the KI again, or get **VIP** for unlimited access!"
+            )
+            return
+
+        # --- Limit erreicht -> Cooldown starten ---
+        if eintrag["anzahl"] >= KI_FREI_LIMIT:
+            eintrag["cooldown_bis"] = jetzt + KI_COOLDOWN_SEKUNDEN
+            usage[user_id] = eintrag
+            ki_usage_speichern(usage)
+            await message.channel.send(
+                f"⏰ {message.author.mention} You have used all **{KI_FREI_LIMIT}** free scripts. "
+                f"You now have a timer of **2 hours** before you can use the KI again, or get **VIP** "
+                f"for unlimited access!"
+            )
+            return
+
+    warte_nachricht = await message.channel.send(
+        f"🤖 {message.author.mention} Generiere deinen Script, bitte kurz warten..."
+    )
+
+    try:
+        script_text = await ki_script_generieren(beschreibung)
+    except Exception as e:
+        await warte_nachricht.edit(
+            content=f"❌ {message.author.mention} Bei der KI-Generierung ist ein Fehler aufgetreten: `{e}`"
+        )
+        return
+
+    if not script_text:
+        await warte_nachricht.edit(
+            content=f"❌ {message.author.mention} Die KI hat keinen Script zurückgegeben. Versuch es erneut."
+        )
+        return
+
+    # --- Nutzung hochzählen (nur für Nicht-VIP) ---
+    if not ist_vip:
+        eintrag["anzahl"] = eintrag.get("anzahl", 0) + 1
+        usage[user_id] = eintrag
+        ki_usage_speichern(usage)
+        rest_scripts = KI_FREI_LIMIT - eintrag["anzahl"]
+        status_text = (
+            f"✅ Noch **{rest_scripts}/{KI_FREI_LIMIT}** kostenlose Scripts übrig."
+            if rest_scripts > 0 else
+            "⚠️ Das war dein letzter kostenloser Script für die nächsten 2 Stunden."
+        )
+    else:
+        status_text = "👑 VIP – unbegrenzte Nutzung."
+
+    header = f"🤖 {message.author.mention} Hier ist dein Roblox Studio Script:\n{status_text}\n"
+    await warte_nachricht.delete()
+
+    # --- Discord-Nachrichten sind auf 2000 Zeichen begrenzt -> ggf. aufteilen ---
+    if len(script_text) <= 1900:
+        await message.channel.send(f"{header}{script_text}")
+    else:
+        await message.channel.send(header)
+        for i in range(0, len(script_text), 1900):
+            chunk = script_text[i:i + 1900]
+            await message.channel.send(chunk)
+
+# =========================================================================
+# ====================== ENDE KI SCRIPT GENERATOR ==========================
+# =========================================================================
+
+# =========================================================================
 # ============================== AUTOMOD ====================================
 # =========================================================================
 
@@ -1357,6 +1538,21 @@ async def on_message(message: discord.Message):
                 return
 
             if inhalt == "?verfy" and str(message.channel.id) == config.get("check_channel_id"):
+                await vip_verfy_ablauf(message)
+                return
+
+        # --- KI-Script-Generator: nur im per /creatki eingerichteten Channel ---
+        ki_config = ki_config_laden()
+        if ki_config is not None and str(message.channel.id) == ki_config.get("channel_id"):
+            original_inhalt = message.content.strip()
+
+            if original_inhalt.lower().startswith("?ki"):
+                beschreibung = original_inhalt[3:].strip()
+                await ki_ablauf(message, beschreibung)
+                return
+
+            # --- ?Vip: prüft (wie ?Verfy) den Game-Pass-Kauf und vergibt bei Erfolg die VIP-Rolle ---
+            if inhalt == "?vip":
                 await vip_verfy_ablauf(message)
                 return
 
@@ -2034,6 +2230,31 @@ async def vipauto(
 
 # =========================================================================
 # ========================= ENDE VIP-COMMANDS ================================
+# =========================================================================
+
+# =========================================================================
+# ============================ KI-COMMANDS ==================================
+# =========================================================================
+
+# --- /creatki: Admin richtet den Channel für den KI-Script-Generator ein ---
+@bot.tree.command(name="creatki", description="[Admin] Richtet den Channel für den KI-Script-Generator (?ki) ein")
+@app_commands.describe(channel="In welchem Channel dürfen Spieler '?ki <Beschreibung>' benutzen?")
+@app_commands.checks.has_permissions(administrator=True)
+async def creatki(interaction: discord.Interaction, channel: discord.TextChannel):
+    ki_config_speichern({"channel_id": str(channel.id)})
+
+    await interaction.response.send_message(
+        f"✅ KI-Script-Generator eingerichtet in {channel.mention}!\n"
+        f"🤖 Jeder Spieler kann dort `?ki <Beschreibung>` schreiben, z.B.:\n"
+        f"> `?ki mach ein part unsichtbar wenn man es anklickt`\n"
+        f"📊 Kostenlos: **{KI_FREI_LIMIT} Scripts** pro Spieler, danach **2 Stunden** Cooldown.\n"
+        f"👑 VIP (unbegrenzt) erhält man über `?Vip` im selben Channel – geprüft wird der Game Pass "
+        f"aus `/vipauto` (Roblox-Account vorher mit `?VerfyRoblox` verknüpfen).",
+        ephemeral=True
+    )
+
+# =========================================================================
+# ========================= ENDE KI-COMMANDS =================================
 # =========================================================================
 
 # --- Bot starten ---
