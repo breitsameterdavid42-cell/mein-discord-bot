@@ -6,6 +6,8 @@ import random
 import json
 import asyncio
 import datetime
+import re
+import aiohttp
 
 # --- Rollenname, der /newvideo nutzen darf (muss EXAKT so heißen wie deine Rolle) ---
 ERLAUBTE_ROLLE = "⭐ᴄᴏɴᴛᴇɴᴛ ᴄʀᴇᴀᴛᴏʀ"
@@ -800,6 +802,241 @@ class ApplyReviewView(discord.ui.View):
 # ============================= ENDE APPLY =================================
 # =========================================================================
 
+# =========================================================================
+# ============================== VIP AUTO ==================================
+# =========================================================================
+
+# --- Speicherort für die per /vipauto eingerichtete Konfiguration ---
+VIP_CONFIG_DATEI = "vip_config.json"
+
+def vip_config_laden():
+    if os.path.exists(VIP_CONFIG_DATEI):
+        with open(VIP_CONFIG_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def vip_config_speichern(config):
+    with open(VIP_CONFIG_DATEI, "w") as f:
+        json.dump(config, f)
+
+# --- Speicherort für alle verknüpften Discord <-> Roblox Accounts ---
+VIP_LINKS_DATEI = "vip_links.json"
+
+def vip_links_laden():
+    if os.path.exists(VIP_LINKS_DATEI):
+        with open(VIP_LINKS_DATEI, "r") as f:
+            return json.load(f)
+    return {}  # { "discord_id": {"roblox_id": ..., "roblox_name": ...} }
+
+def vip_links_speichern(links):
+    with open(VIP_LINKS_DATEI, "w") as f:
+        json.dump(links, f)
+
+# --- Speicherort für alle JEMALS verifizierten Roblox-Namen (wird NIE wieder freigegeben) ---
+VIP_GESPERRTE_NAMEN_DATEI = "vip_gesperrte_namen.json"
+
+def vip_gesperrte_namen_laden():
+    if os.path.exists(VIP_GESPERRTE_NAMEN_DATEI):
+        with open(VIP_GESPERRTE_NAMEN_DATEI, "r") as f:
+            return json.load(f)
+    return {}  # { "roblox_name_lowercase": "discord_id" }
+
+def vip_gesperrte_namen_speichern(namen):
+    with open(VIP_GESPERRTE_NAMEN_DATEI, "w") as f:
+        json.dump(namen, f)
+
+async def roblox_userid_von_name(username: str):
+    """Fragt bei Roblox die User-ID zu einem Benutzernamen ab. Gibt (id, echter_name) oder None zurück."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://users.roblox.com/v1/usernames/users",
+                json={"usernames": [username], "excludeBannedUsers": True},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                daten = await resp.json()
+                ergebnisse = daten.get("data", [])
+                if not ergebnisse:
+                    return None
+                return ergebnisse[0]["id"], ergebnisse[0]["name"]
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+
+async def roblox_besitzt_gamepass(user_id: int, gamepass_id: str) -> bool:
+    """Prüft, ob ein Roblox-User einen bestimmten Game Pass besitzt."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://inventory.roblox.com/v1/users/{user_id}/items/GamePass/{gamepass_id}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return False
+                daten = await resp.json()
+                return len(daten.get("data", [])) > 0
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+
+async def vip_verfyroblox_ablauf(message: discord.Message):
+    """Ablauf für '?VerfyRoblox': User verknüpft seinen Roblox-Namen dauerhaft mit seinem Discord-Account."""
+    links = vip_links_laden()
+    if str(message.author.id) in links:
+        bereits = links[str(message.author.id)]["roblox_name"]
+        await message.channel.send(
+            f"⚠️ {message.author.mention} Du bist bereits verifiziert als **{bereits}**.",
+            delete_after=15
+        )
+        return
+
+    frage_nachricht = await message.channel.send(
+        f"{message.author.mention} Schreib jetzt deinen **Roblox-Benutzernamen** hier in den Chat. Du hast 2 Minuten Zeit."
+    )
+
+    def check(m: discord.Message) -> bool:
+        return m.author.id == message.author.id and m.channel.id == message.channel.id
+
+    try:
+        antwort = await bot.wait_for("message", check=check, timeout=120)
+    except asyncio.TimeoutError:
+        await message.channel.send(f"⏰ {message.author.mention} Zeit abgelaufen. Schreib erneut `?VerfyRoblox`, um es nochmal zu versuchen.", delete_after=15)
+        return
+
+    roblox_name_eingabe = antwort.content.strip()
+    ergebnis = await roblox_userid_von_name(roblox_name_eingabe)
+    if ergebnis is None:
+        await message.channel.send(
+            f"❌ {message.author.mention} Dieser Roblox-Name wurde nicht gefunden. Schreib erneut `?VerfyRoblox`, um es nochmal zu versuchen.",
+            delete_after=20
+        )
+        return
+
+    roblox_id, roblox_name_echt = ergebnis
+    name_key = roblox_name_echt.lower()
+
+    gesperrte_namen = vip_gesperrte_namen_laden()
+    if name_key in gesperrte_namen:
+        await message.channel.send(
+            f"❌ {message.author.mention} Der Roblox-Name **{roblox_name_echt}** wurde bereits verwendet und kann nicht erneut verknüpft werden.",
+            delete_after=20
+        )
+        return
+
+    # --- Verknüpfung dauerhaft speichern, Name wird für immer gesperrt ---
+    links[str(message.author.id)] = {"roblox_id": roblox_id, "roblox_name": roblox_name_echt}
+    vip_links_speichern(links)
+
+    gesperrte_namen[name_key] = str(message.author.id)
+    vip_gesperrte_namen_speichern(gesperrte_namen)
+
+    await message.channel.send(
+        f"✅ {message.author.mention} Erfolgreich verknüpft mit Roblox-Account **{roblox_name_echt}**! "
+        f"Dieser Name ist jetzt für immer an deinen Discord-Account gebunden."
+    )
+
+async def vip_verfy_ablauf(message: discord.Message):
+    """Ablauf für '?Verfy': prüft, ob der verknüpfte Roblox-Account den Game Pass besitzt, und vergibt ggf. die Rolle."""
+    config = vip_config_laden()
+    if config is None or not config.get("gamepass_id"):
+        await message.channel.send("⚠️ Das VIP-System wurde noch nicht eingerichtet. Ein Admin muss zuerst `/vipauto` nutzen.", delete_after=15)
+        return
+
+    links = vip_links_laden()
+    link = links.get(str(message.author.id))
+    if link is None:
+        await message.channel.send(
+            f"⚠️ {message.author.mention} Du musst dich zuerst mit `?VerfyRoblox` im Verify-Channel verknüpfen.",
+            delete_after=15
+        )
+        return
+
+    warte_nachricht = await message.channel.send(f"⏳ Prüfe, ob **{link['roblox_name']}** den Game Pass besitzt...")
+
+    besitzt = await roblox_besitzt_gamepass(link["roblox_id"], config["gamepass_id"])
+
+    if not besitzt:
+        await warte_nachricht.edit(
+            content=f"❌ {message.author.mention} **{link['roblox_name']}** besitzt den Game Pass noch nicht. Kauf ihn und versuch es erneut mit `?Verfy`."
+        )
+        return
+
+    rolle = message.guild.get_role(int(config["rolle_id"]))
+    if rolle is None:
+        await warte_nachricht.edit(content="⚠️ Die eingerichtete Rolle existiert nicht mehr. Bitte einen Admin kontaktieren.")
+        return
+
+    try:
+        await message.author.add_roles(rolle)
+    except discord.HTTPException:
+        await warte_nachricht.edit(content="⚠️ Ich konnte dir die Rolle nicht geben. Habe ich genug Rechte?")
+        return
+
+    await warte_nachricht.edit(
+        content=f"✅ {message.author.mention} Bestätigt! **{link['roblox_name']}** besitzt den Game Pass. Du hast jetzt die Rolle **{rolle.name}**!"
+    )
+
+# =========================================================================
+# ============================ ENDE VIP AUTO ================================
+# =========================================================================
+
+# =========================================================================
+# ============================== AUTOMOD ====================================
+# =========================================================================
+
+# --- Erkennt Discord-Einladungslinks (discord.gg/..., discord.com/invite/..., usw.) ---
+DISCORD_INVITE_REGEX = re.compile(r"(discord\.gg/|discord(?:app)?\.com/invite/)\S+", re.IGNORECASE)
+
+# --- Merkt sich die letzten Nachrichten-Zeitpunkte pro User, um Spam zu erkennen ---
+spam_tracker: dict[int, list[float]] = {}
+SPAM_NACHRICHTEN_ANZAHL = 5   # ab wie vielen Nachrichten...
+SPAM_ZEITFENSTER = 5          # ...innerhalb von wie vielen Sekunden gilt es als Spam
+
+async def automod_timeout(message: discord.Message, dauer: datetime.timedelta, grund: str):
+    """Verhängt ein Timeout und informiert den User im Channel."""
+    try:
+        await message.author.timeout(dauer, reason=grund)
+        await message.channel.send(
+            f"🔇 {message.author.mention} wurde für **{grund}** getimeoutet.",
+            delete_after=10
+        )
+    except discord.HTTPException:
+        pass
+
+async def automod_pruefen(message: discord.Message) -> bool:
+    """Prüft eine Nachricht auf Automod-Verstöße. Gibt True zurück, wenn eine Aktion ausgeführt wurde."""
+    if message.author.bot or message.guild is None:
+        return False
+
+    # --- Admins/Owner werden von der Automod nicht erfasst ---
+    if message.author.guild_permissions.administrator:
+        return False
+
+    # --- 1) Discord-Invite-Link erkannt -> 2 Stunden Timeout ---
+    if DISCORD_INVITE_REGEX.search(message.content):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        await automod_timeout(message, datetime.timedelta(hours=2), "Posten eines Discord-Invite-Links")
+        return True
+
+    # --- 2) Spam-Erkennung -> 5 Minuten Timeout ---
+    jetzt = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    zeitstempel = spam_tracker.get(message.author.id, [])
+    zeitstempel = [t for t in zeitstempel if jetzt - t < SPAM_ZEITFENSTER]  # alte Einträge rauswerfen
+    zeitstempel.append(jetzt)
+    spam_tracker[message.author.id] = zeitstempel
+
+    if len(zeitstempel) >= SPAM_NACHRICHTEN_ANZAHL:
+        spam_tracker[message.author.id] = []  # zurücksetzen, damit nicht sofort nochmal ausgelöst wird
+        await automod_timeout(message, datetime.timedelta(minutes=5), "Spammen")
+        return True
+
+    return False
+
+# =========================================================================
+# ============================= ENDE AUTOMOD =================================
+# =========================================================================
+
 # --- Einstellungen ---
 TOKEN = os.getenv("TOKEN")  # Token kommt aus Umgebungsvariable (z.B. bei Railway eingetragen)
 PREFIX = "!"  # Befehle starten z.B. mit !hallo
@@ -1099,6 +1336,33 @@ async def on_ready():
         print(f"Fehler beim Sync: {e}")
 
 # --- Ein einfacher Befehl: !hallo ---
+# --- Zentrale Nachrichtenprüfung: Automod (Invite-Links/Spam) + VIP-Befehle (?VerfyRoblox / ?Verfy) ---
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # --- Automod zuerst prüfen (löscht ggf. die Nachricht und timeoutet den User) ---
+    verstoss = await automod_pruefen(message)
+    if verstoss:
+        return  # bei einem Verstoß werden keine weiteren Befehle mehr aus dieser Nachricht ausgeführt
+
+    if message.guild is not None:
+        config = vip_config_laden()
+        inhalt = message.content.strip().lower()
+
+        if config is not None:
+            if inhalt == "?verfyroblox" and str(message.channel.id) == config.get("verify_channel_id"):
+                await vip_verfyroblox_ablauf(message)
+                return
+
+            if inhalt == "?verfy" and str(message.channel.id) == config.get("check_channel_id"):
+                await vip_verfy_ablauf(message)
+                return
+
+    # --- Wichtig: sorgt dafür, dass die normalen !Befehle (z.B. !hallo) weiter funktionieren ---
+    await bot.process_commands(message)
+
 @bot.command()
 async def hallo(ctx):
     await ctx.send(f"Hallo {ctx.author.mention}! 👋")
@@ -1729,6 +1993,47 @@ async def apply_panel_posten(interaction: discord.Interaction):
 
 # =========================================================================
 # ========================= ENDE APPLY-COMMANDS ============================
+# =========================================================================
+
+# =========================================================================
+# ============================ VIP-COMMANDS =================================
+# =========================================================================
+
+# --- /vipauto: Admin richtet Game Pass, Verify-Channel, Check-Channel und die VIP-Rolle ein ---
+@bot.tree.command(name="vipauto", description="[Admin] Richtet das automatische VIP-Game-Pass-System ein")
+@app_commands.describe(
+    gamepass_id="Die ID deines Roblox Game Pass (Zahl aus dem Game-Pass-Link)",
+    verify_channel="Channel, in dem User mit '?VerfyRoblox' ihren Roblox-Namen verknüpfen",
+    check_channel="Channel, in dem User mit '?Verfy' den Game-Pass-Kauf prüfen lassen",
+    rolle="Welche Rolle wird vergeben, wenn der Game Pass gekauft wurde?"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def vipauto(
+    interaction: discord.Interaction,
+    gamepass_id: str,
+    verify_channel: discord.TextChannel,
+    check_channel: discord.TextChannel,
+    rolle: discord.Role
+):
+    config = {
+        "gamepass_id": gamepass_id,
+        "verify_channel_id": str(verify_channel.id),
+        "check_channel_id": str(check_channel.id),
+        "rolle_id": str(rolle.id)
+    }
+    vip_config_speichern(config)
+
+    await interaction.response.send_message(
+        f"✅ VIP-Auto-System eingerichtet!\n"
+        f"🆔 Game Pass ID: `{gamepass_id}`\n"
+        f"📝 Verifizieren mit `?VerfyRoblox` in {verify_channel.mention}\n"
+        f"🔍 Kauf prüfen mit `?Verfy` in {check_channel.mention}\n"
+        f"🎭 Belohnungsrolle: **{rolle.name}**",
+        ephemeral=True
+    )
+
+# =========================================================================
+# ========================= ENDE VIP-COMMANDS ================================
 # =========================================================================
 
 # --- Bot starten ---
