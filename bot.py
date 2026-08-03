@@ -1740,8 +1740,9 @@ def check_config_speichern(config):
 
 # --- /check: postet den nächsten Activity-Check-Tag und reagiert automatisch mit ✅ ---
 @bot.tree.command(name="check", description="[Admin] Postet den nächsten Activity Check (Tag zählt automatisch hoch)")
+@app_commands.describe(rolle="Optional: Diese Rolle wird automatisch gepingt")
 @app_commands.checks.has_permissions(administrator=True)
-async def check(interaction: discord.Interaction):
+async def check(interaction: discord.Interaction, rolle: discord.Role = None):
     config = check_config_laden()
     config["tag"] = config.get("tag", 0) + 1
     tag = config["tag"]
@@ -1757,7 +1758,9 @@ async def check(interaction: discord.Interaction):
     )
     embed.set_footer(text=f"Activity Check Day {tag}")
 
-    await interaction.response.send_message(embed=embed)
+    ping_text = rolle.mention if rolle is not None else ""
+
+    await interaction.response.send_message(content=ping_text, embed=embed)
     gesendete_nachricht = await interaction.original_response()
     await gesendete_nachricht.add_reaction("✅")
 
