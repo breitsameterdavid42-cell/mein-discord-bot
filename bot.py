@@ -97,6 +97,53 @@ def giveaways_speichern(giveaways):
     with open(GIVEAWAY_DATEI, "w") as f:
         json.dump(giveaways, f)
 
+# --- Speicherort für die per /welcome-setup eingerichtete Config ---
+WELCOME_DATEI = "welcome_config.json"
+
+def welcome_config_laden():
+    if os.path.exists(WELCOME_DATEI):
+        with open(WELCOME_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def welcome_config_speichern(config):
+    with open(WELCOME_DATEI, "w") as f:
+        json.dump(config, f)
+
+def welcome_embed_bauen(member: discord.Member, config: dict) -> discord.Embed:
+    """Baut das Willkommens-Embed für ein neues Mitglied, ähnlich dem Screenshot-Stil."""
+    server = member.guild
+
+    beschreibung = config.get(
+        "nachricht",
+        "Glad to have you here. Check out our channels and enjoy your stay! 🎉"
+    )
+    # Platzhalter im Nachrichtentext ersetzen
+    beschreibung = beschreibung.replace("{mention}", member.mention).replace("{server}", server.name)
+
+    farbe = config.get("farbe", 0x2F3136)
+    embed = discord.Embed(color=farbe)
+    embed.set_author(name=f"{server.name}", icon_url=server.icon.url if server.icon else discord.Embed.Empty)
+
+    embed.title = "New Member Joined!"
+    embed.description = (
+        f"👋 Welcome {member.mention} to **{server.name}**!\n\n{beschreibung}"
+    )
+
+    account_erstellt = f"<t:{int(member.created_at.timestamp())}:R>"
+    embed.add_field(name="Account Created", value=account_erstellt, inline=False)
+    embed.add_field(name="Member Count", value=f"#{server.member_count}", inline=False)
+
+    if config.get("bild"):
+        embed.set_thumbnail(url=config["bild"])
+
+    embed.set_footer(
+        text=f"{server.name} • Welcome System",
+        icon_url=server.icon.url if server.icon else discord.Embed.Empty
+    )
+    embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    return embed
+
 # --- Speicherort für alle laufenden Timer ---
 TIMER_DATEI = "timer_config.json"
 
@@ -1588,12 +1635,82 @@ async def serverinfo(ctx):
     server = ctx.guild
     await ctx.send(f"📊 **{server.name}** hat {server.member_count} Mitglieder.")
 
-# --- Neue Mitglieder automatisch begrüßen ---
+# --- Neue Mitglieder automatisch begrüßen (per /welcome-setup konfigurierbar) ---
 @bot.event
 async def on_member_join(member):
-    kanal = discord.utils.get(member.guild.text_channels, name="willkommen")  # Kanalname anpassen!
-    if kanal:
-        await kanal.send(f"Willkommen auf dem Server, {member.mention}! 🎉")
+    config = welcome_config_laden()
+    if not config:
+        return  # noch nicht eingerichtet
+
+    kanal = member.guild.get_channel(int(config["channel_id"]))
+    if kanal is None:
+        return
+
+    embed = welcome_embed_bauen(member, config)
+    ping_text = member.mention if config.get("pingen", True) else None
+
+    try:
+        await kanal.send(content=ping_text, embed=embed)
+    except discord.HTTPException:
+        pass
+
+# --- /welcome-setup: Admin richtet das Willkommens-System ein ---
+@bot.tree.command(name="welcome-setup", description="[Admin] Richtet die automatische Willkommensnachricht ein")
+@app_commands.describe(
+    channel="In welchem Channel sollen neue Mitglieder begrüßt werden?",
+    nachricht="Eigener Begrüßungstext (optional). Platzhalter: {mention}, {server}",
+    bild="Bild-URL fürs Embed, z.B. Server-Logo (optional)",
+    farbe_hex="Hex-Farbcode fürs Embed, z.B. 2F3136 (optional)",
+    pingen="Soll der User zusätzlich zum Embed gepingt werden? (Standard: ja)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def welcome_setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    nachricht: str = None,
+    bild: str = None,
+    farbe_hex: str = None,
+    pingen: bool = True
+):
+    farbe = 0x2F3136
+    if farbe_hex:
+        try:
+            farbe = int(farbe_hex.strip("#"), 16)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ Ungültiger Hex-Farbcode. Beispiel: `2F3136`",
+                ephemeral=True
+            )
+            return
+
+    config = {
+        "channel_id": str(channel.id),
+        "nachricht": nachricht,
+        "bild": bild,
+        "farbe": farbe,
+        "pingen": pingen
+    }
+    welcome_config_speichern(config)
+
+    await interaction.response.send_message(
+        f"✅ Willkommens-System eingerichtet! Neue Mitglieder werden ab jetzt in {channel.mention} begrüßt.",
+        ephemeral=True
+    )
+
+# --- /welcome-test: Admin kann die Willkommensnachricht testweise auslösen ---
+@bot.tree.command(name="welcome-test", description="[Admin] Testet die Willkommensnachricht mit deinem eigenen Account")
+@app_commands.checks.has_permissions(administrator=True)
+async def welcome_test(interaction: discord.Interaction):
+    config = welcome_config_laden()
+    if not config:
+        await interaction.response.send_message(
+            "⚠️ Richte zuerst `/welcome-setup` ein.",
+            ephemeral=True
+        )
+        return
+
+    embed = welcome_embed_bauen(interaction.user, config)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # --- /newvideo: Neuer Content-Post (nur für die erlaubte Rolle) ---
 @bot.tree.command(name="newvideo", description="Poste einen neuen Video-Link")
