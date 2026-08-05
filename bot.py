@@ -195,6 +195,97 @@ def timer_embed_bauen(daten: dict, rest_sekunden: int, abgelaufen: bool = False)
     embed.set_footer(text=f"Gestartet von {daten.get('ersteller_name', 'Unbekannt')}")
     return embed
 
+# =========================================================================
+# ============================= LEVEL-SYSTEM =================================
+# =========================================================================
+
+# --- Speicherort für die per /level-setup eingerichtete Config (welcher Channel bekommt Level-up-Meldungen) ---
+LEVEL_CONFIG_DATEI = "level_config.json"
+
+def level_config_laden():
+    if os.path.exists(LEVEL_CONFIG_DATEI):
+        with open(LEVEL_CONFIG_DATEI, "r") as f:
+            return json.load(f)
+    return None
+
+def level_config_speichern(config):
+    with open(LEVEL_CONFIG_DATEI, "w") as f:
+        json.dump(config, f)
+
+# --- Speicherort für die XP/Level-Daten aller User (User-ID -> {"xp": int, "level": int}) ---
+LEVEL_DATEI = "level_data.json"
+
+def level_daten_laden():
+    if os.path.exists(LEVEL_DATEI):
+        with open(LEVEL_DATEI, "r") as f:
+            return json.load(f)
+    return {}
+
+def level_daten_speichern(daten):
+    with open(LEVEL_DATEI, "w") as f:
+        json.dump(daten, f)
+
+def level_xp_fuer_levelup(level: int) -> int:
+    """Wie viel XP werden benötigt, um von `level` auf `level + 1` aufzusteigen (steigt mit dem Level)."""
+    return 5 * (level ** 2) + 50 * level + 100
+
+# --- Cooldown pro User, damit nicht jede einzelne Nachricht XP gibt (nur im Arbeitsspeicher) ---
+LEVEL_COOLDOWN_SEKUNDEN = 60
+_level_cooldowns = {}
+
+async def level_xp_vergeben(message: discord.Message):
+    """Vergibt zufällig XP für eine Nachricht (mit Cooldown) und postet bei einem Levelaufstieg
+    automatisch eine Meldung mit Profilbild und Erwähnung des Users im eingerichteten Channel."""
+    config = level_config_laden()
+    if config is None:
+        return  # Level-System noch nicht per /level-setup eingerichtet
+
+    user_id = str(message.author.id)
+    jetzt = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    letzte_xp = _level_cooldowns.get(user_id, 0)
+    if jetzt - letzte_xp < LEVEL_COOLDOWN_SEKUNDEN:
+        return
+    _level_cooldowns[user_id] = jetzt
+
+    daten = level_daten_laden()
+    eintrag = daten.get(user_id, {"xp": 0, "level": 0})
+    eintrag["xp"] += random.randint(15, 25)
+
+    aufgestiegen = False
+    while eintrag["xp"] >= level_xp_fuer_levelup(eintrag["level"]):
+        eintrag["xp"] -= level_xp_fuer_levelup(eintrag["level"])
+        eintrag["level"] += 1
+        aufgestiegen = True
+
+    daten[user_id] = eintrag
+    level_daten_speichern(daten)
+
+    if not aufgestiegen:
+        return
+
+    channel = message.guild.get_channel(int(config["channel_id"]))
+    if channel is None:
+        return
+
+    # --- Level-up-Meldung auf Englisch, mit Profilbild und Erwähnung des Users ---
+    embed = discord.Embed(
+        title="🎉 Level Up!",
+        description=f"{message.author.mention} just leveled up to **Level {eintrag['level']}**! Keep it up! 🚀",
+        color=discord.Color.gold()
+    )
+    embed.set_thumbnail(url=message.author.display_avatar.url)
+    embed.set_footer(text=f"{message.guild.name} • Leveling System")
+    embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+
+    try:
+        await channel.send(content=message.author.mention, embed=embed)
+    except discord.HTTPException:
+        pass
+
+# =========================================================================
+# ========================= ENDE LEVEL-SYSTEM =================================
+# =========================================================================
+
 # --- Merkt sich laufende Timer-Tasks, damit sie z.B. per /timerstop abgebrochen werden können ---
 timer_tasks: dict[str, asyncio.Task] = {}
 
@@ -640,28 +731,91 @@ def apply_zaehler_erhoehen():
     return zaehler
 
 MAX_APPLY_FRAGEN = 20
+MAX_APPLY_TYPEN = 25  # Discord-Limit für Optionen in einem Auswahlmenü
 
-# --- Panel mit dem "Apply starten"-Knopf ---
+def apply_typ_slug(name: str) -> str:
+    """Erzeugt aus einem Anzeigenamen eine URL-/JSON-sichere ID, z.B. 'VIP Leaker' -> 'vip_leaker'."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug or "typ"
+
+def apply_typ_finden(setup: dict, name: str):
+    """Sucht eine Bewerbungsart anhand ihres Anzeigenamens (Groß-/Kleinschreibung egal)."""
+    if not setup:
+        return None
+    for typ in setup.get("typen", []):
+        if typ["name"].lower() == name.lower():
+            return typ
+    return None
+
+async def apply_typ_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete-Vorschläge für den 'typ'-Parameter der Apply-Commands."""
+    setup = apply_setup_laden()
+    typen = setup.get("typen", []) if setup else []
+    return [
+        app_commands.Choice(name=t["name"], value=t["name"])
+        for t in typen if current.lower() in t["name"].lower()
+    ][:25]
+
+# --- Panel mit dem Auswahlmenü ("Moderator", "Developer", "VIP Leaker", ...) ---
 class ApplyPanelView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # timeout=None = Button funktioniert dauerhaft, auch nach Neustart
+        super().__init__(timeout=None)  # timeout=None = Menü funktioniert dauerhaft, auch nach Neustart
+        self._optionen_aktualisieren()
 
-    @discord.ui.button(label="Apply starten", style=discord.ButtonStyle.success, emoji="📋", custom_id="apply_start")
-    async def apply_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def _optionen_aktualisieren(self):
+        """Lädt die aktuell eingerichteten Bewerbungsarten aus der Config in das Auswahlmenü."""
         setup = apply_setup_laden()
-        if setup is None or not setup.get("fragen"):
+        typen = setup.get("typen", []) if setup else []
+
+        if typen:
+            self.apply_select.options = [
+                discord.SelectOption(
+                    label=t["name"][:100],
+                    value=t["id"],
+                    description=(t.get("beschreibung") or None),
+                    emoji=t.get("emoji") or None
+                )
+                for t in typen[:MAX_APPLY_TYPEN]
+            ]
+            self.apply_select.placeholder = (setup or {}).get("platzhalter", "Wähle eine Bewerbung aus...")
+            self.apply_select.disabled = False
+        else:
+            self.apply_select.options = [discord.SelectOption(label="Keine Bewerbungen verfügbar", value="_none_")]
+            self.apply_select.placeholder = "Noch keine Bewerbungsarten eingerichtet"
+            self.apply_select.disabled = True
+
+    @discord.ui.select(
+        placeholder="Wähle eine Bewerbung aus...",
+        custom_id="apply_select",
+        options=[discord.SelectOption(label="Lade...", value="_loading_")]
+    )
+    async def apply_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        typ_id = select.values[0]
+        setup = apply_setup_laden()
+        typen = setup.get("typen", []) if setup else []
+        typ = next((t for t in typen if t["id"] == typ_id), None)
+
+        if typ is None:
+            await interaction.response.send_message("⚠️ Diese Bewerbung existiert nicht mehr.", ephemeral=True)
+            return
+
+        if not typ.get("fragen"):
             await interaction.response.send_message(
-                "⚠️ Es sind noch keine Fragen eingerichtet. Ein Admin muss zuerst `/apply-frage-hinzufuegen` nutzen.",
+                f"⚠️ Für **{typ['name']}** sind noch keine Fragen eingerichtet. Ein Admin muss zuerst `/apply-frage-hinzufuegen` nutzen.",
                 ephemeral=True
             )
             return
 
-        # --- Verhindern, dass jemand mehrere offene Bewerbungen gleichzeitig hat ---
+        # --- Verhindern, dass jemand für dieselbe Bewerbungsart mehrere offene Bewerbungen hat ---
         alle_bewerbungen = bewerbungen_laden()
         for b_id, daten in alle_bewerbungen.items():
-            if daten["opener_id"] == str(interaction.user.id) and daten.get("status") == "offen":
+            if (
+                daten["opener_id"] == str(interaction.user.id)
+                and daten.get("status") == "offen"
+                and daten.get("typ_id") == typ_id
+            ):
                 await interaction.response.send_message(
-                    "⚠️ Du hast bereits eine laufende Bewerbung. Beantworte zuerst die Fragen in deinen DMs.",
+                    f"⚠️ Du hast bereits eine laufende Bewerbung für **{typ['name']}**. Beantworte zuerst die Fragen in deinen DMs.",
                     ephemeral=True
                 )
                 return
@@ -669,9 +823,9 @@ class ApplyPanelView(discord.ui.View):
         try:
             dm_channel = await interaction.user.create_dm()
             await dm_channel.send(embed=discord.Embed(
-                title="📋 Bewerbung gestartet",
+                title=f"📋 Bewerbung gestartet: {typ['name']}",
                 description=(
-                    f"Du beantwortest jetzt **{len(setup['fragen'])} Fragen**.\n"
+                    f"Du beantwortest jetzt **{len(typ['fragen'])} Fragen**.\n"
                     f"Schreib deine Antwort einfach hier in den Chat. Du hast pro Frage **10 Minuten** Zeit."
                 ),
                 color=discord.Color.blurple()
@@ -684,14 +838,16 @@ class ApplyPanelView(discord.ui.View):
             return
 
         await interaction.response.send_message(
-            "✅ Ich hab dir eine DM geschickt! Beantworte dort die Fragen.",
+            f"✅ Ich hab dir eine DM geschickt! Beantworte dort die Fragen für **{typ['name']}**.",
             ephemeral=True
         )
 
-        bot.loop.create_task(apply_ablauf_durchfuehren(interaction.user, interaction.guild.id, dm_channel, setup["fragen"]))
+        bot.loop.create_task(apply_ablauf_durchfuehren(interaction.user, interaction.guild.id, dm_channel, typ))
 
-async def apply_ablauf_durchfuehren(user: discord.User, guild_id: int, dm_channel: discord.DMChannel, fragen: list[str]):
-    """Stellt dem User nacheinander alle Fragen per DM und wartet jeweils auf seine Antwort."""
+async def apply_ablauf_durchfuehren(user: discord.User, guild_id: int, dm_channel: discord.DMChannel, typ: dict):
+    """Stellt dem User nacheinander alle Fragen der gewählten Bewerbungsart per DM und wartet jeweils auf seine Antwort."""
+    fragen = typ["fragen"]
+
     def check(nachricht: discord.Message) -> bool:
         return nachricht.author.id == user.id and isinstance(nachricht.channel, discord.DMChannel)
 
@@ -706,7 +862,7 @@ async def apply_ablauf_durchfuehren(user: discord.User, guild_id: int, dm_channe
             antwort_nachricht = await bot.wait_for("message", check=check, timeout=600)
         except asyncio.TimeoutError:
             await dm_channel.send(
-                "⏰ Zeit abgelaufen. Deine Bewerbung wurde abgebrochen. Du kannst jederzeit über den Button erneut starten."
+                "⏰ Zeit abgelaufen. Deine Bewerbung wurde abgebrochen. Du kannst jederzeit über das Menü erneut starten."
             )
             return
         antworten.append(antwort_nachricht.content or "[kein Text / nur Anhang]")
@@ -725,6 +881,9 @@ async def apply_ablauf_durchfuehren(user: discord.User, guild_id: int, dm_channe
         "opener_id": str(user.id),
         "opener_name": str(user),
         "guild_id": str(guild_id),
+        "typ_id": typ["id"],
+        "typ_name": typ["name"],
+        "accept_rolle_id": typ.get("accept_rolle_id"),
         "fragen": fragen,
         "antworten": antworten,
         "status": "offen",
@@ -733,13 +892,13 @@ async def apply_ablauf_durchfuehren(user: discord.User, guild_id: int, dm_channe
     }
 
     embed = discord.Embed(
-        title=f"📋 Neue Bewerbung von {user}",
+        title=f"📋 Neue Bewerbung von {user} — {typ['name']}",
         color=discord.Color.orange()
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     for i, (frage, antwort) in enumerate(zip(fragen, antworten), start=1):
         embed.add_field(name=f"{i}. {frage}", value=antwort[:1024], inline=False)
-    embed.set_footer(text=f"User-ID: {user.id} | Bewerbung #{bewerbung_id}")
+    embed.set_footer(text=f"User-ID: {user.id} | Bewerbung #{bewerbung_id} | Art: {typ['name']}")
 
     if review_channel is not None:
         try:
@@ -788,8 +947,7 @@ class ApplyReviewView(discord.ui.View):
         if daten is None:
             return
 
-        setup = apply_setup_laden()
-        rolle = interaction.guild.get_role(int(setup["accept_rolle_id"])) if setup else None
+        rolle = interaction.guild.get_role(int(daten["accept_rolle_id"])) if daten.get("accept_rolle_id") else None
         mitglied = interaction.guild.get_member(int(daten["opener_id"]))
 
         if rolle is not None and mitglied is not None:
@@ -812,7 +970,10 @@ class ApplyReviewView(discord.ui.View):
             try:
                 await mitglied.send(embed=discord.Embed(
                     title="✅ Deine Bewerbung wurde angenommen!",
-                    description=f"Herzlichen Glückwunsch! Du hast jetzt die Rolle **{rolle.name if rolle else ''}** erhalten.",
+                    description=(
+                        f"Herzlichen Glückwunsch! Deine Bewerbung als **{daten.get('typ_name', 'Unbekannt')}** wurde angenommen.\n"
+                        f"Du hast jetzt die Rolle **{rolle.name if rolle else ''}** erhalten."
+                    ),
                     color=discord.Color.green()
                 ))
             except discord.HTTPException:
@@ -1525,7 +1686,7 @@ async def on_ready():
     bot.add_view(VoiceCreatorView())
     bot.add_view(TicketPanelView())  # Ticket-Panel-Knöpfe bleiben nach Neustart klickbar
     bot.add_view(TicketActionView())  # Übernehmen/Übergeben/Schließen bleiben nach Neustart klickbar
-    bot.add_view(ApplyPanelView())  # "Apply starten"-Knopf bleibt nach Neustart klickbar
+    bot.add_view(ApplyPanelView())  # Bewerbungs-Auswahlmenü bleibt nach Neustart funktionsfähig
 
     # --- Offene Bewerbungen nach einem Neustart wiederherstellen, damit die Buttons noch reagieren ---
     bewerbungen = bewerbungen_laden()
@@ -1573,6 +1734,9 @@ async def on_message(message: discord.Message):
         return  # bei einem Verstoß werden keine weiteren Befehle mehr aus dieser Nachricht ausgeführt
 
     if message.guild is not None:
+        # --- Level-System: XP vergeben und ggf. Level-up-Meldung posten (eigener Task, blockiert nichts) ---
+        bot.loop.create_task(level_xp_vergeben(message))
+
         config = vip_config_laden()
         inhalt = message.content.strip().lower()
 
@@ -2207,16 +2371,15 @@ async def newticketsystem(
 # =========================== APPLY-COMMANDS ===============================
 # =========================================================================
 
-# --- /apply-setup: Admin richtet Titel, Beschreibung, Channels und die Annahme-Rolle ein ---
-@bot.tree.command(name="apply-setup", description="[Admin] Richtet das Apply-System ein und postet das Panel")
+# --- /apply-setup: Admin richtet Titel, Beschreibung und Channels ein (Bewerbungsarten kommen per /apply-typ-hinzufuegen dazu) ---
+@bot.tree.command(name="apply-setup", description="[Admin] Richtet das Bewerbungssystem ein und postet das Panel mit Auswahlmenü")
 @app_commands.describe(
-    channel="In welchem Channel soll der 'Apply starten'-Knopf gepostet werden?",
+    channel="In welchem Channel soll das Auswahlmenü gepostet werden?",
     titel="Titel des Panel-Embeds",
     beschreibung="Beschreibungstext des Panel-Embeds",
     review_channel="In welchem Channel sollen fertige Bewerbungen erscheinen?",
-    rolle="Welche Rolle wird bei Annahme vergeben?",
     bild="Bild-URL, die im Panel angezeigt wird (optional)",
-    knopf_text="Beschriftung des Buttons (Standard: Apply starten)"
+    platzhalter="Platzhaltertext im Auswahlmenü (Standard: 'Wähle eine Bewerbung aus...')"
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def apply_setup(
@@ -2225,20 +2388,18 @@ async def apply_setup(
     titel: str,
     beschreibung: str,
     review_channel: discord.TextChannel,
-    rolle: discord.Role,
     bild: str = None,
-    knopf_text: str = "Apply starten"
+    platzhalter: str = "Wähle eine Bewerbung aus..."
 ):
     bestehende_config = apply_setup_laden() or {}
     config = {
         "panel_channel_id": str(channel.id),
         "review_channel_id": str(review_channel.id),
-        "accept_rolle_id": str(rolle.id),
         "titel": titel,
         "beschreibung": beschreibung,
         "bild": bild,
-        "knopf_text": knopf_text,
-        "fragen": bestehende_config.get("fragen", []),
+        "platzhalter": platzhalter,
+        "typen": bestehende_config.get("typen", []),
         "zaehler": bestehende_config.get("zaehler", 0)
     }
     apply_setup_speichern(config)
@@ -2248,84 +2409,216 @@ async def apply_setup(
         embed.set_image(url=bild)
 
     view = ApplyPanelView()
-    view.apply_start.label = knopf_text
     await channel.send(embed=embed, view=view)
 
-    anzahl_fragen = len(config["fragen"])
-    hinweis = "" if anzahl_fragen > 0 else "\n⚠️ Es sind noch keine Fragen eingerichtet! Nutze `/apply-frage-hinzufuegen`."
+    anzahl_typen = len(config["typen"])
+    hinweis = "" if anzahl_typen > 0 else "\n⚠️ Es sind noch keine Bewerbungsarten eingerichtet! Nutze `/apply-typ-hinzufuegen`."
     await interaction.response.send_message(
-        f"✅ Apply-System eingerichtet! Panel gepostet in {channel.mention}.\n"
+        f"✅ Bewerbungssystem eingerichtet! Panel gepostet in {channel.mention}.\n"
         f"Fertige Bewerbungen landen in {review_channel.mention}.\n"
-        f"Bei Annahme wird die Rolle **{rolle.name}** vergeben.\n"
-        f"Aktuell eingerichtete Fragen: **{anzahl_fragen}**{hinweis}",
+        f"Aktuell eingerichtete Bewerbungsarten: **{anzahl_typen}**{hinweis}",
         ephemeral=True
     )
 
-# --- /apply-frage-hinzufuegen: Admin fügt eine einzelne Frage hinzu (bis zu 20) ---
-@bot.tree.command(name="apply-frage-hinzufuegen", description="[Admin] Fügt eine Frage zur Bewerbung hinzu (max. 20)")
-@app_commands.describe(frage="Der Text der Frage")
+# --- /apply-typ-hinzufuegen: Admin fügt eine neue Bewerbungsart zum Auswahlmenü hinzu (bis zu 25) ---
+@bot.tree.command(name="apply-typ-hinzufuegen", description="[Admin] Fügt eine neue Bewerbungsart zum Auswahlmenü hinzu (max. 25)")
+@app_commands.describe(
+    name="Anzeigename im Auswahlmenü, z.B. 'Moderator' oder 'VIP Leaker'",
+    rolle="Welche Rolle wird vergeben, wenn diese Bewerbung angenommen wird?",
+    emoji="Optionales Emoji für das Auswahlmenü, z.B. 🛡️",
+    beschreibung="Optionale kurze Beschreibung, die im Auswahlmenü angezeigt wird"
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def apply_frage_hinzufuegen(interaction: discord.Interaction, frage: str):
+async def apply_typ_hinzufuegen(
+    interaction: discord.Interaction,
+    name: str,
+    rolle: discord.Role,
+    emoji: str = None,
+    beschreibung: str = None
+):
     setup = apply_setup_laden()
     if setup is None:
         await interaction.response.send_message(
-            "⚠️ Richte zuerst `/apply-setup` ein, bevor du Fragen hinzufügst.",
+            "⚠️ Richte zuerst `/apply-setup` ein, bevor du Bewerbungsarten hinzufügst.",
             ephemeral=True
         )
         return
 
-    fragen = setup.get("fragen", [])
+    typen = setup.get("typen", [])
+
+    if apply_typ_finden(setup, name) is not None:
+        await interaction.response.send_message(
+            f"⚠️ Es gibt bereits eine Bewerbungsart namens **{name}**.",
+            ephemeral=True
+        )
+        return
+
+    if len(typen) >= MAX_APPLY_TYPEN:
+        await interaction.response.send_message(
+            f"⚠️ Es sind bereits {MAX_APPLY_TYPEN} Bewerbungsarten eingerichtet (Discord-Limit für Auswahlmenüs).",
+            ephemeral=True
+        )
+        return
+
+    basis_slug = apply_typ_slug(name)
+    slug = basis_slug
+    bestehende_ids = {t["id"] for t in typen}
+    zaehler = 2
+    while slug in bestehende_ids:
+        slug = f"{basis_slug}_{zaehler}"
+        zaehler += 1
+
+    typen.append({
+        "id": slug,
+        "name": name,
+        "emoji": emoji,
+        "beschreibung": beschreibung,
+        "accept_rolle_id": str(rolle.id),
+        "fragen": []
+    })
+    setup["typen"] = typen
+    apply_setup_speichern(setup)
+
+    await interaction.response.send_message(
+        f"✅ Bewerbungsart **{name}** hinzugefügt ({len(typen)}/{MAX_APPLY_TYPEN}).\n"
+        f"🎭 Rolle bei Annahme: **{rolle.name}**\n"
+        f"❓ Füge jetzt Fragen hinzu mit `/apply-frage-hinzufuegen typ:{name}`.\n"
+        f"📌 Nutze danach `/apply-panel-posten`, damit das Auswahlmenü aktualisiert wird.",
+        ephemeral=True
+    )
+
+# --- /apply-typ-entfernen: Admin entfernt eine Bewerbungsart aus dem Auswahlmenü ---
+@bot.tree.command(name="apply-typ-entfernen", description="[Admin] Entfernt eine Bewerbungsart aus dem Auswahlmenü")
+@app_commands.describe(name="Name der Bewerbungsart (siehe /apply-typen-anzeigen)")
+@app_commands.autocomplete(name=apply_typ_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_typ_entfernen(interaction: discord.Interaction, name: str):
+    setup = apply_setup_laden()
+    typ = apply_typ_finden(setup, name) if setup else None
+    if typ is None:
+        await interaction.response.send_message("⚠️ Diese Bewerbungsart wurde nicht gefunden.", ephemeral=True)
+        return
+
+    setup["typen"] = [t for t in setup["typen"] if t["id"] != typ["id"]]
+    apply_setup_speichern(setup)
+
+    await interaction.response.send_message(
+        f"✅ Bewerbungsart **{typ['name']}** entfernt.\n"
+        f"📌 Nutze `/apply-panel-posten`, damit das Auswahlmenü aktualisiert wird.",
+        ephemeral=True
+    )
+
+# --- /apply-typen-anzeigen: Zeigt alle aktuell eingerichteten Bewerbungsarten ---
+@bot.tree.command(name="apply-typen-anzeigen", description="[Admin] Zeigt alle eingerichteten Bewerbungsarten")
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_typen_anzeigen(interaction: discord.Interaction):
+    setup = apply_setup_laden()
+    typen = setup.get("typen", []) if setup else []
+
+    if not typen:
+        await interaction.response.send_message("⚠️ Es sind noch keine Bewerbungsarten eingerichtet.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=f"📋 Bewerbungsarten ({len(typen)}/{MAX_APPLY_TYPEN})", color=discord.Color.blurple())
+    for typ in typen:
+        rolle = interaction.guild.get_role(int(typ["accept_rolle_id"])) if typ.get("accept_rolle_id") else None
+        rollen_text = rolle.mention if rolle else "⚠️ Rolle nicht gefunden"
+        name_anzeige = f"{typ.get('emoji') or ''} {typ['name']}".strip()
+        embed.add_field(
+            name=name_anzeige,
+            value=f"🎭 Rolle: {rollen_text}\n❓ Fragen: {len(typ.get('fragen', []))}/{MAX_APPLY_FRAGEN}",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- /apply-frage-hinzufuegen: Admin fügt einer Bewerbungsart eine einzelne Frage hinzu (bis zu 20) ---
+@bot.tree.command(name="apply-frage-hinzufuegen", description="[Admin] Fügt einer Bewerbungsart eine Frage hinzu (max. 20)")
+@app_commands.describe(
+    typ="Für welche Bewerbungsart? (siehe /apply-typen-anzeigen)",
+    frage="Der Text der Frage"
+)
+@app_commands.autocomplete(typ=apply_typ_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def apply_frage_hinzufuegen(interaction: discord.Interaction, typ: str, frage: str):
+    setup = apply_setup_laden()
+    ziel_typ = apply_typ_finden(setup, typ) if setup else None
+    if ziel_typ is None:
+        await interaction.response.send_message(
+            "⚠️ Diese Bewerbungsart wurde nicht gefunden. Lege sie zuerst mit `/apply-typ-hinzufuegen` an.",
+            ephemeral=True
+        )
+        return
+
+    fragen = ziel_typ.get("fragen", [])
     if len(fragen) >= MAX_APPLY_FRAGEN:
         await interaction.response.send_message(
-            f"⚠️ Es sind bereits {MAX_APPLY_FRAGEN} Fragen eingerichtet (Maximum erreicht).",
+            f"⚠️ Für **{ziel_typ['name']}** sind bereits {MAX_APPLY_FRAGEN} Fragen eingerichtet (Maximum erreicht).",
             ephemeral=True
         )
         return
 
     fragen.append(frage)
-    setup["fragen"] = fragen
+    ziel_typ["fragen"] = fragen
     apply_setup_speichern(setup)
 
     await interaction.response.send_message(
-        f"✅ Frage **{len(fragen)}/{MAX_APPLY_FRAGEN}** hinzugefügt:\n> {frage}",
+        f"✅ Frage **{len(fragen)}/{MAX_APPLY_FRAGEN}** zu **{ziel_typ['name']}** hinzugefügt:\n> {frage}",
         ephemeral=True
     )
 
-# --- /apply-fragen-anzeigen: Zeigt alle aktuell eingerichteten Fragen ---
-@bot.tree.command(name="apply-fragen-anzeigen", description="[Admin] Zeigt alle eingerichteten Bewerbungsfragen")
+# --- /apply-fragen-anzeigen: Zeigt alle aktuell eingerichteten Fragen einer Bewerbungsart ---
+@bot.tree.command(name="apply-fragen-anzeigen", description="[Admin] Zeigt alle eingerichteten Fragen einer Bewerbungsart")
+@app_commands.describe(typ="Für welche Bewerbungsart? (siehe /apply-typen-anzeigen)")
+@app_commands.autocomplete(typ=apply_typ_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
-async def apply_fragen_anzeigen(interaction: discord.Interaction):
+async def apply_fragen_anzeigen(interaction: discord.Interaction, typ: str):
     setup = apply_setup_laden()
-    fragen = setup.get("fragen", []) if setup else []
+    ziel_typ = apply_typ_finden(setup, typ) if setup else None
+    if ziel_typ is None:
+        await interaction.response.send_message("⚠️ Diese Bewerbungsart wurde nicht gefunden.", ephemeral=True)
+        return
 
+    fragen = ziel_typ.get("fragen", [])
     if not fragen:
-        await interaction.response.send_message("⚠️ Es sind noch keine Fragen eingerichtet.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ Für **{ziel_typ['name']}** sind noch keine Fragen eingerichtet.", ephemeral=True)
         return
 
     text = "\n".join(f"**{i}.** {f}" for i, f in enumerate(fragen, start=1))
-    embed = discord.Embed(title=f"📋 Bewerbungsfragen ({len(fragen)}/{MAX_APPLY_FRAGEN})", description=text, color=discord.Color.blurple())
+    embed = discord.Embed(
+        title=f"📋 Fragen für {ziel_typ['name']} ({len(fragen)}/{MAX_APPLY_FRAGEN})",
+        description=text,
+        color=discord.Color.blurple()
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- /apply-frage-entfernen: Entfernt eine Frage anhand ihrer Nummer ---
-@bot.tree.command(name="apply-frage-entfernen", description="[Admin] Entfernt eine Bewerbungsfrage anhand ihrer Nummer")
-@app_commands.describe(nummer="Die Nummer der Frage (siehe /apply-fragen-anzeigen)")
+# --- /apply-frage-entfernen: Entfernt eine Frage einer Bewerbungsart anhand ihrer Nummer ---
+@bot.tree.command(name="apply-frage-entfernen", description="[Admin] Entfernt eine Frage einer Bewerbungsart anhand ihrer Nummer")
+@app_commands.describe(
+    typ="Für welche Bewerbungsart? (siehe /apply-typen-anzeigen)",
+    nummer="Die Nummer der Frage (siehe /apply-fragen-anzeigen)"
+)
+@app_commands.autocomplete(typ=apply_typ_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
-async def apply_frage_entfernen(interaction: discord.Interaction, nummer: int):
+async def apply_frage_entfernen(interaction: discord.Interaction, typ: str, nummer: int):
     setup = apply_setup_laden()
-    fragen = setup.get("fragen", []) if setup else []
+    ziel_typ = apply_typ_finden(setup, typ) if setup else None
+    fragen = ziel_typ.get("fragen", []) if ziel_typ else []
 
-    if not fragen or nummer < 1 or nummer > len(fragen):
-        await interaction.response.send_message("⚠️ Ungültige Nummer. Nutze `/apply-fragen-anzeigen`, um die Nummern zu sehen.", ephemeral=True)
+    if ziel_typ is None or not fragen or nummer < 1 or nummer > len(fragen):
+        await interaction.response.send_message(
+            "⚠️ Ungültige Bewerbungsart oder Nummer. Nutze `/apply-fragen-anzeigen`, um die Nummern zu sehen.",
+            ephemeral=True
+        )
         return
 
     entfernt = fragen.pop(nummer - 1)
-    setup["fragen"] = fragen
+    ziel_typ["fragen"] = fragen
     apply_setup_speichern(setup)
 
-    await interaction.response.send_message(f"✅ Frage entfernt: \n> {entfernt}", ephemeral=True)
+    await interaction.response.send_message(f"✅ Frage aus **{ziel_typ['name']}** entfernt: \n> {entfernt}", ephemeral=True)
 
-# --- /apply-panel-posten: Postet das Panel erneut (z.B. nach Änderungen an den Fragen) ---
-@bot.tree.command(name="apply-panel-posten", description="[Admin] Postet das Apply-Panel erneut im eingerichteten Channel")
+# --- /apply-panel-posten: Postet das Panel erneut (z.B. nach Änderungen an den Bewerbungsarten/Fragen) ---
+@bot.tree.command(name="apply-panel-posten", description="[Admin] Postet das Bewerbungs-Panel erneut im eingerichteten Channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def apply_panel_posten(interaction: discord.Interaction):
     setup = apply_setup_laden()
@@ -2343,7 +2636,6 @@ async def apply_panel_posten(interaction: discord.Interaction):
         embed.set_image(url=setup["bild"])
 
     view = ApplyPanelView()
-    view.apply_start.label = setup.get("knopf_text", "Apply starten")
     await channel.send(embed=embed, view=view)
 
     await interaction.response.send_message(f"✅ Panel erneut gepostet in {channel.mention}.", ephemeral=True)
@@ -2417,6 +2709,41 @@ async def creatki(interaction: discord.Interaction, channel: discord.TextChannel
 
 # =========================================================================
 # ========================= ENDE KI-COMMANDS =================================
+# =========================================================================
+
+# =========================================================================
+# =========================== LEVEL-COMMANDS =================================
+# =========================================================================
+
+# --- /level-setup: Admin wählt automatisch den Channel für Level-up-Meldungen aus ---
+@bot.tree.command(name="level-setup", description="[Admin] Wählt den Channel, in dem Level-up-Meldungen automatisch gepostet werden")
+@app_commands.describe(channel="In welchem Channel sollen Level-ups angezeigt werden?")
+@app_commands.checks.has_permissions(administrator=True)
+async def level_setup(interaction: discord.Interaction, channel: discord.TextChannel):
+    level_config_speichern({"channel_id": str(channel.id)})
+
+    await interaction.response.send_message(
+        f"✅ Level-System eingerichtet! Level-ups werden ab jetzt automatisch in {channel.mention} gepostet "
+        f"(mit Profilbild und Erwähnung des Users, auf Englisch).\n"
+        f"📈 User bekommen zufällig XP pro Nachricht (mit {LEVEL_COOLDOWN_SEKUNDEN}s Cooldown, um Spam zu verhindern).",
+        ephemeral=True
+    )
+
+# --- /rank: Zeigt das eigene aktuelle Level und den XP-Fortschritt ---
+@bot.tree.command(name="rank", description="Zeigt dein aktuelles Level und deinen XP-Fortschritt")
+async def rank(interaction: discord.Interaction):
+    daten = level_daten_laden()
+    eintrag = daten.get(str(interaction.user.id), {"xp": 0, "level": 0})
+    benoetigt = level_xp_fuer_levelup(eintrag["level"])
+
+    embed = discord.Embed(title=f"📊 Rank von {interaction.user.display_name}", color=discord.Color.blurple())
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.add_field(name="Level", value=str(eintrag["level"]), inline=True)
+    embed.add_field(name="XP", value=f"{eintrag['xp']} / {benoetigt}", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# =========================================================================
+# ========================= ENDE LEVEL-COMMANDS ================================
 # =========================================================================
 
 # --- Bot starten ---
